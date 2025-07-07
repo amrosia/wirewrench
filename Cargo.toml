@@ -1,0 +1,16 @@
+[package]
+name = "wirewrench"
+version = "1.0.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+categories = ["command-line-utilities"]
+description = "A Command-Line Utility for Web Shell Interaction via URL-Based Injection"
+
+[dependencies]
+clap = { version = "4.5.40", features = ["derive"] }
+url = "2.5.4"
+ariadne = "0.3"
+rustyline = "16.0.0"
+reqwest = "0.12.22"
+tokio = { version = "1.46.1", features = ["full"] }
+rand = "0.9.1"
