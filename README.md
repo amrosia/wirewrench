@@ -1,6 +1,8 @@
 # WireWrench
 
 Instead of manually modifying the URL each time a command needs to be executed, and having to URL encode characters, WireWrench automates the injection process, allowing pentesters to focus on payloads and responses rather than repetitive typing.
+## Comparison (curl vs wirewrench)
+![comparison](https://files.catbox.moe/e5pjoa.gif)
 
 ## Features
 
