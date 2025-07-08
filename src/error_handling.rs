@@ -2,21 +2,10 @@ use ariadne::{Label, Report, ReportKind, Source};
 use std::error::Error;
 use std::fmt;
 
-/// Errors that can occur during URL injection point validation
 #[derive(Debug)]
 pub enum WWError {
-    /// No injection point found in the URL
-    /// 
-    /// Contains:
-    /// - The URL string that was checked
-    /// - The injection point string that was searched for
+    // Using any other number of points than 1 serves no purpose and breaks the whole point 
     NoInjectionPoint(String, String),  // (url, injection_point)
-
-    /// Multiple injection points found in the URL
-    /// 
-    /// Contains:
-    /// - The URL string that was checked
-    /// - The injection point string that was found multiple times
     TooManyInjectionPoints(String, String),  // (url, injection_point)
 }
 
@@ -33,25 +22,14 @@ impl fmt::Display for WWError {
     }
 }
 
-/// Finds all occurrences of an injection point in a string
-/// 
-/// Returns a vector of (start, end) position tuples for each match
+// This is here so that underlining of each supplied point would match its length.
 fn find_injection_positions(s: &str, injection: &str) -> Vec<(usize, usize)> {
     s.match_indices(injection)
         .map(|(start, matched)| (start, start + matched.len()))
         .collect()
 }
 
-impl WWError {
-    /// Displays a user-friendly error message using ariadne's pretty error reporting
-    /// 
-    /// # Arguments
-    /// * `err` - The error to display
-    /// 
-    /// The error display includes:
-    /// - A descriptive message
-    /// - Visual indicators showing problematic URL sections
-    /// - Help text explaining how to fix the issue
+impl WWError { 
     pub fn display_error(err: &WWError) {
         match err {
             WWError::NoInjectionPoint(url, injection) => {
@@ -94,7 +72,6 @@ impl WWError {
     }
 }
 
-/// A wrapper type for injection point strings that ensures they contain no whitespace
 #[derive(Debug, Clone)]
 pub struct InjectionPoint(pub String);
 
@@ -104,20 +81,10 @@ impl InjectionPoint {
     }
 }
 
+// Injection points with spaces make no sense and no use case
 impl std::str::FromStr for InjectionPoint {
     type Err = &'static str;
-
-    /// Converts a string into an InjectionPoint, validating that it contains no whitespace
-    /// 
-    /// # Errors
-    /// Returns an error if the string contains any whitespace characters
-    /// 
-    /// # Examples
-    /// ```
-    /// use std::str::FromStr;
-    /// let valid = InjectionPoint::from_str("BLUB").unwrap();
-    /// let invalid = InjectionPoint::from_str("BL UB").unwrap_err();
-    /// ```
+  
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if s.chars().any(char::is_whitespace) {
             Err("Injection point cannot contain whitespace")

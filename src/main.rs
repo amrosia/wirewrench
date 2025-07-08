@@ -1,8 +1,7 @@
 #![allow(rustdoc::bare_urls)]
 //! WireWrench - A command-line tool for interacting with web shells by injecting commands into URLs
 //! 
-//! This tool was created to save time from retyping commands while testing URL injections and parameter based web shells
-//! Command line arguments for WireWrench
+//! This tool was created to save time from retyping commands while testing URL injections and parameter-based web shells.
 //! 
 //! # Examples
 //! 
@@ -57,11 +56,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !args.silence {
         Opening::random(&args.url);
     }
-    let mut rl = rustyline::DefaultEditor::new()?;
+    let mut rl = rustyline::DefaultEditor::new()?; 
     
     loop {
         match rl.readline(">> ") {
             Ok(line) => {
+                rl.add_history_entry(&line)?;
                 if let Err(e) = send_request(&args.url, &line, &args.injection_point).await {
                     eprintln!("Request failed: {}", e);
                 }
@@ -76,19 +76,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    
+
     Ok(())
 }
 
-/// Validates that the URL contains exactly one injection point
-/// 
-/// # Arguments
-/// * `url` - The URL to check
-/// * `injection` - The injection point marker to look for
-/// 
-/// # Returns
-/// * `Ok(())` if exactly one injection point is found
-/// * `Err(WWError)` if zero or multiple injection points are found
+// There is no point in using any other number, so this is just error handling.
+// Also, injection point is supplied to each function with URL because it's dynamic and can be provided by user.
 fn check_injection_point(url: &Url, injection: &InjectionPoint) -> Result<(), WWError> {
     let count = url.as_str().matches(injection.as_str()).count();
     match count {
@@ -98,16 +91,7 @@ fn check_injection_point(url: &Url, injection: &InjectionPoint) -> Result<(), WW
     }
 }
 
-/// Sends an HTTP GET request with the injected command
-/// 
-/// # Arguments
-/// * `url` - The base URL containing the injection point
-/// * `command` - The string to inject into the URL
-/// * `injection` - The injection point marker to replace
-/// 
-/// # Returns
-/// * `Ok(())` if the request was successful
-/// * `Err(Box<dyn Error>)` if the request failed or returned a non-200 status
+
 async fn send_request(url: &Url, command: &str, injection: &InjectionPoint) -> Result<(), Box<dyn std::error::Error>> {
     let injected_url = url.as_str().replace(injection.as_str(), command);
     let client = reqwest::Client::new();

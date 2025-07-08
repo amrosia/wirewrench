@@ -11,12 +11,11 @@ static QUOTES: &[&str] = &[
     // I would like to see more suggestions in pull requests
 ];
 
-/// Used for displaying the startup message
 impl Opening {
     fn base(url: &Url) {
         println!("WireWrench v{}", env!("CARGO_PKG_VERSION"));
         println!("https://github.com/amrosia/wirewrench");
-        println!("Using url: {}", url)
+        println!("Using url: {}", url);
     }
 
     pub fn random(url: &Url) {
