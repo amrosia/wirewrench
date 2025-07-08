@@ -23,11 +23,10 @@ Instead of manually modifying the URL each time a command needs to be executed, 
 
 ```shell
 # Default injection point ("BLUB")
-wirewrench https://target.com/shell.php?cmd=BLUB
-
+ww https://target.com/shell.php?cmd=BLUB
 
 # Custom injection marker ("INJECT")
-wirewrench -i INJECT https://target.com/panel.php?exec=INJECT
+ww -i INJECT https://target.com/panel.php?exec=INJECT
 ```
 
 ## Installation

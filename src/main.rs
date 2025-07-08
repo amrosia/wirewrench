@@ -7,12 +7,12 @@
 //! 
 //! Basic usage with default injection point:
 //! ```shell
-//! wirewrench https://example.com/path?param=BLUB
+//! ww https://example.com/path?param=BLUB
 //! ```
 //! 
 //! Custom injection point:
 //! ```shell
-//! wirewrench -i INJECT https://example.com/path?param=INJECT
+//! ww -i INJECT https://example.com/path?param=INJECT
 use clap::Parser;
 use url::Url;
 use std::process;
