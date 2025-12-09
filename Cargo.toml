@@ -1,6 +1,6 @@
 [package]
 name = "wirewrench"
-version = "1.1.1"
+version = "1.1.2"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 categories = ["command-line-utilities"]
@@ -19,3 +19,4 @@ rustyline = "16.0.0"
 reqwest = "0.12.22"
 tokio = { version = "1.46.1", features = ["full"] }
 rand = "0.9.1"
+diff = "0.1.13"

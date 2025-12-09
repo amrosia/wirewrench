@@ -21,6 +21,7 @@ mod openings;
 use error_handling::{WWError, InjectionPoint};
 use rustyline::error::ReadlineError;
 use openings::Opening;
+use diff;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -42,6 +43,15 @@ struct Args {
     /// Suppress the startup message
     #[arg(short = 's', long)]
     silence: bool,
+
+    /// Only show changes from the first command's output.
+    /// The first request's output is stored as a baseline; subsequent requests
+    /// will display only the characters that differ from that baseline.
+    /// To avoid showing garbage content, the first command should be
+    /// something minimal (e.g., an empty command) so that the baseline contains
+    /// only the static parts of the page.
+    #[arg(short = 'd', long)]
+    diff: bool,
 }
 
 #[tokio::main]
@@ -56,13 +66,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !args.silence {
         Opening::random(&args.url);
     }
-    let mut rl = rustyline::DefaultEditor::new()?; 
+    let mut rl = rustyline::DefaultEditor::new()?;
+    let mut baseline = None;
     
     loop {
         match rl.readline(">> ") {
             Ok(line) => {
                 rl.add_history_entry(&line)?;
-                if let Err(e) = send_request(&args.url, &line, &args.injection_point).await {
+                if let Err(e) = send_request(&args.url, &line, &args.injection_point, &mut baseline, args.diff).await {
                     eprintln!("Request failed: {}", e);
                 }
             },
@@ -80,8 +91,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// There is no point in using any other number, so this is just error handling.
-// Also, injection point is supplied to each function with URL because it's dynamic and can be provided by user.
 fn check_injection_point(url: &Url, injection: &InjectionPoint) -> Result<(), WWError> {
     let count = url.as_str().matches(injection.as_str()).count();
     match count {
@@ -91,8 +100,28 @@ fn check_injection_point(url: &Url, injection: &InjectionPoint) -> Result<(), WW
     }
 }
 
+/// Extract the dynamic part (inserted characters) from the diff between baseline and current.
+/// Returns a string containing only the characters that are new in `b` compared to `a`.
+fn extract_dynamic(a: &str, b: &str) -> String {
+    let diff_result = diff::chars(a, b);
+    let mut dynamic = String::new();
+    for change in diff_result {
+        match change {
+            diff::Result::Right(r) => dynamic.push(r),
+            _ => (),
+        }
+    }
+    dynamic
+}
 
-async fn send_request(url: &Url, command: &str, injection: &InjectionPoint) -> Result<(), Box<dyn std::error::Error>> {
+
+async fn send_request(
+    url: &Url,
+    command: &str,
+    injection: &InjectionPoint,
+    baseline: &mut Option<String>,
+    diff: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let injected_url = url.as_str().replace(injection.as_str(), command);
     let client = reqwest::Client::new();
     
@@ -106,7 +135,25 @@ async fn send_request(url: &Url, command: &str, injection: &InjectionPoint) -> R
     }
     
     let body = response.text().await?;
-    println!("{}", body);
+
+    if diff {
+        match baseline {
+            None => {
+                *baseline = Some(body.clone());
+                println!("{}", body);
+            }
+            Some(bl) => {
+                let dynamic = extract_dynamic(bl, &body);
+                if dynamic.is_empty() {
+                    println!("(no changes)");
+                } else {
+                    println!("{}", dynamic);
+                }
+            }
+        }
+    } else {
+        println!("{}", body);
+    }
 
     Ok(())
 }
