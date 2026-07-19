@@ -373,20 +373,29 @@ async fn handle_control(stream: tokio::net::UnixStream, manager: Arc<Mutex<Sessi
             let id = cmd.id.unwrap_or(0);
             let data = cmd.data.unwrap_or_default();
             let command = data.trim().to_string();
+            let wait = cmd.wait.unwrap_or(false);
+            let timeout = cmd.timeout.unwrap_or(3.0);
 
             // Try TCP first
-            let writer_opt = {
+            let tcp_data = {
                 let mg = manager.lock().await;
                 match mg.sessions.get(&id) {
-                    Some(ManagedSession::Tcp(s, _)) => Some(Arc::clone(&s.writer)),
+                    Some(ManagedSession::Tcp(s, b)) => Some((Arc::clone(&s.writer), Arc::clone(b))),
                     _ => None,
                 }
             };
-            if let Some(writer) = writer_opt {
+            if let Some((writer, buf)) = tcp_data {
                 let to_send = format!("{}\n", command);
                 let mut w = writer.lock().await;
                 let _ = w.write_all(to_send.as_bytes()).await;
-                respond!(Response::ok());
+                drop(w);
+
+                if wait {
+                    let output = read_from_buf(&buf, timeout).await;
+                    respond!(Response::with_output(output));
+                } else {
+                    respond!(Response::ok());
+                }
                 return Ok(());
             }
 
@@ -413,8 +422,12 @@ async fn handle_control(stream: tokio::net::UnixStream, manager: Arc<Mutex<Sessi
                 if let Some((config, buf)) = web_data {
                     match web_shell_exec(&config, &command).await {
                         Ok(body) => {
-                            *buf.lock().await = body.into_bytes();
-                            respond!(Response::ok());
+                            if wait {
+                                respond!(Response::with_output(body));
+                            } else {
+                                *buf.lock().await = body.into_bytes();
+                                respond!(Response::ok());
+                            }
                         }
                         Err(e) => respond!(Response::error(e.to_string())),
                     }

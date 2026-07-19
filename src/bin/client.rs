@@ -35,7 +35,21 @@ enum Commands {
     /// List active shells
     List,
     /// Send a command to a shell (non-interactive)
-    Send { id: u32, command: String },
+    Send {
+        id: u32,
+        /// Wait for output with this timeout in seconds
+        #[arg(short = 'w', long)]
+        wait: bool,
+        /// Read command from stdin instead of positional argument
+        #[arg(short = 's', long)]
+        stdin: bool,
+        /// Timeout in seconds when using --wait (default: 3.0)
+        #[arg(short = 't', long, default_value = "3.0")]
+        timeout: f64,
+        /// Command to execute (all remaining arguments, no extra quoting needed)
+        #[arg(trailing_var_arg = true, num_args = 1..)]
+        command: Vec<String>,
+    },
     /// Interact with a shell (Ctrl+C to detach)
     Interact { id: u32 },
     /// Close/kill a shell
@@ -128,39 +142,26 @@ fn cmd_list(socket_path: &str) -> Result<()> {
 
 // ── Send ───────────────────────────────────────────────────────────────────
 
-fn cmd_send(socket_path: &str, id: u32, command: &str) -> Result<()> {
-    // Send command
+fn cmd_send(socket_path: &str, id: u32, command: &str, wait: bool, timeout: f64) -> Result<()> {
     let resp = send_cmd(socket_path, &serde_json::json!({
-        "action": "send", "id": id, "data": format!("{}\n", command)
+        "action": "send", "id": id, "data": format!("{}\n", command),
+        "wait": wait, "timeout": timeout
     }))?;
     if resp["status"] == "error" {
         let msg = resp["message"].as_str().unwrap_or("Unknown");
         eprintln!("Error: {}", msg);
         return Ok(());
     }
-
-    // Wait and read output
-    std::thread::sleep(Duration::from_millis(300));
-    let resp = send_cmd(socket_path, &serde_json::json!({
-        "action": "read", "id": id, "timeout": 1.5
-    }))?;
-    if resp["status"] == "ok"
-        && let Some(out) = resp["output"].as_str()
-            && !out.is_empty() {
+    if wait {
+        if let Some(out) = resp["output"].as_str() {
+            if !out.is_empty() {
                 print!("{}", out);
+                if !out.ends_with('\n') {
+                    println!();
+                }
             }
-
-    // Try trailing output
-    std::thread::sleep(Duration::from_millis(200));
-    let resp = send_cmd(socket_path, &serde_json::json!({
-        "action": "read", "id": id, "timeout": 0.3
-    }))?;
-    if resp["status"] == "ok"
-        && let Some(out) = resp["output"].as_str()
-            && !out.is_empty() {
-                print!("{}", out);
-            }
-
+        }
+    }
     Ok(())
 }
 
@@ -657,7 +658,16 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match &cli.command {
         Commands::List => cmd_list(&cli.socket),
-        Commands::Send { id, command } => cmd_send(&cli.socket, *id, command),
+        Commands::Send { id, command, wait, stdin, timeout } => {
+            let cmd_str = if *stdin {
+                let mut buf = String::new();
+                std::io::stdin().read_to_string(&mut buf)?;
+                buf
+            } else {
+                command.join(" ")
+            };
+            cmd_send(&cli.socket, *id, &cmd_str, *wait, *timeout)
+        }
         Commands::Interact { id } => cmd_interact(&cli.socket, *id),
         Commands::Close { id } => cmd_close(&cli.socket, *id),
         Commands::Script { id, file } => cmd_script(&cli.socket, *id, file),
