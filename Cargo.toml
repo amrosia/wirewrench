@@ -1,22 +1,38 @@
 [package]
 name = "wirewrench"
-version = "1.1.2"
+version = "2.0.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 categories = ["command-line-utilities"]
-description = "A Command-Line Utility for Web Shell Interaction via URL-Based Injection"
+description = "A remote shell toolkit — catch reverse shells, interact with web shells, manage sessions"
 repository = "https://github.com/amrosia/wirewrench"
 
 [[bin]]
 name = "ww"
-path = "src/main.rs"
+path = "src/bin/client.rs"
+
+[[bin]]
+name = "ww-server"
+path = "src/bin/server.rs"
 
 [dependencies]
-clap = { version = "4.5.40", features = ["derive"] }
-url = "2.5.4"
-ariadne = "0.3"
-rustyline = "16.0.0"
-reqwest = "0.12.22"
-tokio = { version = "1.46.1", features = ["full"] }
-rand = "0.9.1"
-diff = "0.1.13"
+tokio = { version = "1", features = ["net", "rt", "sync", "time", "io-util", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+termios = "0.3"
+anyhow = "1"
+ctrlc = "3"
+rustyline = "16"
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls"] }
+url = { version = "2", optional = true }
+
+[features]
+default = ["web"]
+web = ["dep:reqwest", "dep:url"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = "symbols"

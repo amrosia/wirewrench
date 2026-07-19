@@ -1,1 +1,3 @@
-/target
+target/
+*.pyc
+__pycache__/
