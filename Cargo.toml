@@ -15,6 +15,10 @@ path = "src/bin/client.rs"
 name = "ww-server"
 path = "src/bin/server.rs"
 
+[[bin]]
+name = "ww-target"
+path = "src/bin/target.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["net", "rt", "sync", "time", "io-util", "macros"] }
 serde = { version = "1", features = ["derive"] }
@@ -23,7 +27,9 @@ clap = { version = "4", features = ["derive"] }
 termios = "0.3"
 anyhow = "1"
 ctrlc = "3"
-rustyline = "16"
+sha2 = "0.10"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls"] }
 url = { version = "2", optional = true }
 

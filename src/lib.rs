@@ -1,8 +1,11 @@
+pub mod target;
+
 use serde::{Deserialize, Serialize};
 
 /// Control socket path
 pub const DEFAULT_SOCKET: &str = "/tmp/wirewrench.sock";
 pub const DEFAULT_PORT: u16 = 4444;
+pub const DEFAULT_SMART_PORT: u16 = 4446;
 
 // ── Web shell config (serialized in Command.data for register_web) ────────
 

@@ -34,16 +34,13 @@ struct Cli {
 enum Commands {
     /// List active shells
     List,
-    /// Send a command to a shell (non-interactive)
+    /// Send a command to a shell and return output
     Send {
         id: u32,
-        /// Wait for output with this timeout in seconds
-        #[arg(short = 'w', long)]
-        wait: bool,
         /// Read command from stdin instead of positional argument
         #[arg(short = 's', long)]
         stdin: bool,
-        /// Timeout in seconds when using --wait (default: 3.0)
+        /// Timeout in seconds before giving up on output (default: 3.0)
         #[arg(short = 't', long, default_value = "3.0")]
         timeout: f64,
         /// Command to execute (all remaining arguments, no extra quoting needed)
@@ -76,6 +73,35 @@ enum Commands {
         /// Cookie string, curl-style: -b "name=value"
         #[arg(short = 'b', long = "cookie")]
         cookie: Option<String>,
+    },
+    /// Target (ww-target) operations: push, pull, cancel
+    Targ {
+        #[command(subcommand)]
+        action: TargAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum TargAction {
+    /// Upload a file to the target
+    Upload {
+        id: u32,
+        local: String,
+        remote: Option<String>,
+        #[arg(short = 't', long, default_value = "30.0")]
+        timeout: f64,
+    },
+    /// Download a file from the target
+    Download {
+        id: u32,
+        remote: String,
+        local: Option<String>,
+        #[arg(short = 't', long, default_value = "30.0")]
+        timeout: f64,
+    },
+    /// Cancel an ongoing file transfer
+    Cancel {
+        id: u32,
     },
 }
 
@@ -142,24 +168,24 @@ fn cmd_list(socket_path: &str) -> Result<()> {
 
 // ── Send ───────────────────────────────────────────────────────────────────
 
-fn cmd_send(socket_path: &str, id: u32, command: &str, wait: bool, timeout: f64) -> Result<()> {
+fn cmd_send(socket_path: &str, id: u32, command: &str, timeout: f64) -> Result<()> {
     let resp = send_cmd(socket_path, &serde_json::json!({
         "action": "send", "id": id, "data": format!("{}\n", command),
-        "wait": wait, "timeout": timeout
+        "wait": true, "timeout": timeout
     }))?;
     if resp["status"] == "error" {
         let msg = resp["message"].as_str().unwrap_or("Unknown");
         eprintln!("Error: {}", msg);
         return Ok(());
     }
-    if wait {
-        if let Some(out) = resp["output"].as_str() {
-            if !out.is_empty() {
-                print!("{}", out);
-                if !out.ends_with('\n') {
-                    println!();
-                }
+    if let Some(out) = resp["output"].as_str() {
+        if !out.is_empty() {
+            print!("{}", out);
+            if !out.ends_with('\n') {
+                println!();
             }
+        } else {
+            eprintln!("Warning: no output received. Try increasing --timeout (-t) if you expected output.");
         }
     }
     Ok(())
@@ -283,6 +309,122 @@ fn cmd_web(
 
     Ok(())
 }
+
+// ── Targ push ──────────────────────────────────────────────────────────────
+
+fn cmd_targ_upload(socket_path: &str, id: u32, local: &str, remote: Option<&str>, timeout: f64) -> Result<()> {
+    let file_data = std::fs::read(local)
+        .with_context(|| format!("Cannot read file '{}'", local))?;
+    let size = file_data.len();
+
+    let remote_path = match remote {
+        Some(p) => p.to_string(),
+        None => std::path::Path::new(local).file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| local.to_string()),
+    };
+
+    let push_data = serde_json::json!({"path": remote_path, "size": size, "timeout": timeout});
+    let mut stream = std::os::unix::net::UnixStream::connect(Path::new(socket_path))
+        .with_context(|| format!("Cannot connect to '{}'. Is ww-server running?", socket_path))?;
+    stream.set_read_timeout(Some(Duration::from_secs((timeout + 5.0).max(10.0) as u64)))?;
+
+    let cmd_json = serde_json::json!({"action":"push","id":id,"data":push_data.to_string()});
+    let json_line = serde_json::to_string(&cmd_json)? + "\n";
+    stream.write_all(json_line.as_bytes())?;
+    stream.write_all(&file_data)?;
+    stream.flush()?;
+
+    let mut reader = BufReader::new(&stream);
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let resp: Value = serde_json::from_str(line.trim())?;
+    if resp["status"] == "ok" {
+        println!("{}", resp["output"].as_str().unwrap_or("Upload completed"));
+    } else {
+        let msg = resp["message"].as_str().unwrap_or("Unknown error");
+        eprintln!("Error: {}", msg);
+    }
+    Ok(())
+}
+
+// ── Targ pull ──────────────────────────────────────────────────────────────
+
+fn cmd_targ_download(socket_path: &str, id: u32, remote: &str, local: Option<&str>, timeout: f64) -> Result<()> {
+    let pull_data = serde_json::json!({"path": remote, "timeout": timeout});
+    let mut stream = std::os::unix::net::UnixStream::connect(Path::new(socket_path))
+        .with_context(|| format!("Cannot connect to '{}'. Is ww-server running?", socket_path))?;
+    stream.set_read_timeout(Some(Duration::from_secs((timeout + 5.0).max(10.0) as u64)))?;
+
+    let cmd_json = serde_json::json!({"action":"pull","id":id,"data":pull_data.to_string()});
+    let json_line = serde_json::to_string(&cmd_json)? + "\n";
+    stream.write_all(json_line.as_bytes())?;
+    stream.flush()?;
+
+    // Read JSON response line byte-by-byte to avoid swallowing file data
+    let mut resp_buf = Vec::new();
+    loop {
+        let mut byte = [0u8; 1];
+        if stream.read_exact(&mut byte).is_err() { break; }
+        if byte[0] == b'\n' { break; }
+        resp_buf.push(byte[0]);
+    }
+    let resp: Value = match serde_json::from_slice(&resp_buf) {
+        Ok(v) => v,
+        Err(_) => { eprintln!("Error: invalid response from server"); return Ok(()); }
+    };
+    if resp["status"] != "ok" {
+        let msg = resp["message"].as_str().unwrap_or("Unknown error");
+        eprintln!("Error: {}", msg);
+        return Ok(());
+    }
+
+    // Read file size (u64 LE) then raw bytes
+    let mut size_buf = [0u8; 8];
+    if stream.read_exact(&mut size_buf).is_err() {
+        eprintln!("Error: failed to read file size");
+        return Ok(());
+    }
+    let file_size = u64::from_le_bytes(size_buf) as usize;
+
+    let mut file_data = vec![0u8; file_size];
+    if file_size > 0 {
+        if stream.read_exact(&mut file_data).is_err() {
+            eprintln!("Error: failed to read file data");
+            return Ok(());
+        }
+    }
+
+    // Determine local path
+    let local_path = match local {
+        Some(p) => p.to_string(),
+        None => std::path::Path::new(remote).file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "downloaded".to_string()),
+    };
+
+    // Write to file
+    std::fs::write(&local_path, &file_data)
+        .with_context(|| format!("Failed to write '{}'", local_path))?;
+
+    println!("{}", resp["output"].as_str().unwrap_or("Download completed"));
+    Ok(())
+}
+
+// ── Targ cancel ────────────────────────────────────────────────────────────
+
+fn cmd_targ_cancel(socket_path: &str, id: u32) -> Result<()> {
+    let resp = send_cmd(socket_path, &serde_json::json!({"action":"targ_cancel","id":id}))?;
+    if resp["status"] == "ok" {
+        println!("Cancel sent for session #{}", id);
+    } else {
+        let msg = resp["message"].as_str().unwrap_or("Unknown error");
+        eprintln!("Error: {}", msg);
+    }
+    Ok(())
+}
+
+// ── Interact ───────────────────────────────────────────────────────────────
 
 fn cmd_interact(socket_path: &str, id: u32) -> Result<()> {
     let stdin_fd = std::io::stdin().as_raw_fd();
@@ -658,7 +800,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match &cli.command {
         Commands::List => cmd_list(&cli.socket),
-        Commands::Send { id, command, wait, stdin, timeout } => {
+        Commands::Send { id, command, stdin, timeout } => {
             let cmd_str = if *stdin {
                 let mut buf = String::new();
                 std::io::stdin().read_to_string(&mut buf)?;
@@ -666,7 +808,7 @@ fn main() -> Result<()> {
             } else {
                 command.join(" ")
             };
-            cmd_send(&cli.socket, *id, &cmd_str, *wait, *timeout)
+            cmd_send(&cli.socket, *id, &cmd_str, *timeout)
         }
         Commands::Interact { id } => cmd_interact(&cli.socket, *id),
         Commands::Close { id } => cmd_close(&cli.socket, *id),
@@ -674,6 +816,17 @@ fn main() -> Result<()> {
         #[cfg(feature = "web")]
         Commands::Web { url, injection_point, method, data, headers, cookie } => {
             cmd_web(&cli.socket, url, injection_point, method, data, headers, cookie)
+        }
+        Commands::Targ { action } => match action {
+            TargAction::Upload { id, local, remote, timeout } => {
+                cmd_targ_upload(&cli.socket, *id, local, remote.as_deref(), *timeout)
+            }
+            TargAction::Download { id, remote, local, timeout } => {
+                cmd_targ_download(&cli.socket, *id, remote, local.as_deref(), *timeout)
+            }
+            TargAction::Cancel { id } => {
+                cmd_targ_cancel(&cli.socket, *id)
+            }
         }
     }
 }
