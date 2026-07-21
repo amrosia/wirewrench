@@ -65,6 +65,27 @@ fn write_json_frame(w: &mut impl Write, frame_type: u8, value: &impl serde::Seri
     write_frame(w, frame_type, json.as_bytes())
 }
 
+// ── Pipe forwarder ──────────────────────────────────────────────────────────
+
+/// Spawn a thread that reads lines from `reader` and sends them as FRAME_SHELL packets.
+fn spawn_pipe_to_frames<R: Read + Send + 'static>(reader: R, writer: impl Write + Send + 'static) {
+    thread::spawn(move || {
+        let mut reader = BufReader::new(reader);
+        let mut w = writer;
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let _ = write_frame(&mut w, FRAME_SHELL, &buf);
+                }
+                Err(_) => break,
+            }
+        }
+    });
+}
+
 // ── Session ─────────────────────────────────────────────────────────────────
 
 fn run_session(stream: TcpStream) -> Result<()> {
@@ -95,39 +116,9 @@ fn run_session(stream: TcpStream) -> Result<()> {
     let child_stdout = child.stdout.take().unwrap();
     let child_stderr = child.stderr.take().unwrap();
 
-    // Thread: read shell stdout → send SHELL frames
-    let mut w_stdout = writer.try_clone()?;
-    thread::spawn(move || {
-        let mut reader = BufReader::new(child_stdout);
-        let mut buf = Vec::new();
-        loop {
-            buf.clear();
-            match reader.read_until(b'\n', &mut buf) {
-                Ok(0) => break,
-                Ok(_) => {
-                    let _ = write_frame(&mut w_stdout, FRAME_SHELL, &buf);
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    // Thread: read shell stderr → send SHELL frames
-    let mut w_stderr = writer.try_clone()?;
-    thread::spawn(move || {
-        let mut reader = BufReader::new(child_stderr);
-        let mut buf = Vec::new();
-        loop {
-            buf.clear();
-            match reader.read_until(b'\n', &mut buf) {
-                Ok(0) => break,
-                Ok(_) => {
-                    let _ = write_frame(&mut w_stderr, FRAME_SHELL, &buf);
-                }
-                Err(_) => break,
-            }
-        }
-    });
+    // Threads: read shell stdout/stderr → send SHELL frames
+    spawn_pipe_to_frames(child_stdout, writer.try_clone()?);
+    spawn_pipe_to_frames(child_stderr, writer.try_clone()?);
 
     // ── Main loop: read frames from server ───────────────────────
     loop {

@@ -38,20 +38,25 @@ pub struct Response {
     pub shells: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
 }
 
 impl Response {
     pub fn ok() -> Self {
-        Self { status: "ok".into(), message: None, shells: None, output: None }
+        Self { status: "ok".into(), message: None, shells: None, output: None, exit_code: None }
     }
     pub fn error(msg: impl Into<String>) -> Self {
-        Self { status: "error".into(), message: Some(msg.into()), shells: None, output: None }
+        Self { status: "error".into(), message: Some(msg.into()), shells: None, output: None, exit_code: None }
     }
     pub fn with_shells(shells: serde_json::Value) -> Self {
-        Self { status: "ok".into(), message: None, shells: Some(shells), output: None }
+        Self { status: "ok".into(), message: None, shells: Some(shells), output: None, exit_code: None }
     }
     pub fn with_output(out: String) -> Self {
-        Self { status: "ok".into(), message: None, shells: None, output: Some(out) }
+        Self { status: "ok".into(), message: None, shells: None, output: Some(out), exit_code: None }
+    }
+    pub fn with_output_exit(out: String, code: i32) -> Self {
+        Self { status: "ok".into(), message: None, shells: None, output: Some(out), exit_code: Some(code) }
     }
 }
 

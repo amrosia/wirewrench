@@ -40,7 +40,16 @@ enum Commands {
     Interact { id: u32 },
     /// Close/kill a shell
     Close { id: u32 },
-    /// Run commands from a file
+    /// Run commands from a plain-text script file, one command per line
+    ///
+    /// Lines starting with `#` are treated as comments and skipped.
+    /// Empty lines are also skipped.  Each command is sent to the shell
+    /// sequentially (with a 300 ms delay between them) and its output
+    /// is printed to stdout.
+    ///
+    /// The file is a simple list of commands — not a shell script.
+    /// Pipes, redirects, variables, and other shell syntax are passed
+    /// verbatim to the remote shell and are NOT interpreted locally.
     Script { id: u32, file: String },
     /// Register a web shell with the server (curl-like flags)
     #[cfg(feature = "web")]
@@ -301,8 +310,7 @@ fn cmd_targ_upload(socket_path: &str, id: u32, local: &str, remote: Option<&str>
     };
 
     let push_data = serde_json::json!({"path": remote_path, "size": size, "timeout": timeout});
-    let mut stream = std::os::unix::net::UnixStream::connect(Path::new(socket_path))
-        .with_context(|| format!("Cannot connect to '{}'. Is ww-server running?", socket_path))?;
+    let mut stream = connect(socket_path)?;
     stream.set_read_timeout(Some(Duration::from_secs((timeout + 5.0).max(10.0) as u64)))?;
 
     let cmd_json = serde_json::json!({"action":"push","id":id,"data":push_data.to_string()});
@@ -328,8 +336,7 @@ fn cmd_targ_upload(socket_path: &str, id: u32, local: &str, remote: Option<&str>
 
 fn cmd_targ_download(socket_path: &str, id: u32, remote: &str, local: Option<&str>, timeout: f64) -> Result<()> {
     let pull_data = serde_json::json!({"path": remote, "timeout": timeout});
-    let mut stream = std::os::unix::net::UnixStream::connect(Path::new(socket_path))
-        .with_context(|| format!("Cannot connect to '{}'. Is ww-server running?", socket_path))?;
+    let mut stream = connect(socket_path)?;
     stream.set_read_timeout(Some(Duration::from_secs((timeout + 5.0).max(10.0) as u64)))?;
 
     let cmd_json = serde_json::json!({"action":"pull","id":id,"data":pull_data.to_string()});
