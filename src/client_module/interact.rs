@@ -37,25 +37,7 @@ pub fn cmd_interact(socket_path: &str, id: u32) -> Result<()> {
         eprintln!("Error: {}", msg); return Ok(());
     }
 
-    if resp["message"].as_str().map(|m| m.contains("target")).unwrap_or(false) {
-        interact_rl(stream)
-    } else {
-        let stdin_fd = std::io::stdin().as_raw_fd();
-        let is_tty = unsafe { isatty(stdin_fd) } != 0;
-        let mut old_term: Option<Termios> = None;
-        let sigint = Arc::new(AtomicBool::new(false));
-
-        if is_tty { match set_raw_mode(stdin_fd) { Ok(t) => old_term = Some(t), Err(e) => eprintln!("Warning: could not set raw mode: {}", e), } }
-
-        let sigint_flag = Arc::clone(&sigint);
-        let restore_term = old_term; let rfd = stdin_fd;
-        ctrlc::set_handler(move || { sigint_flag.store(true, Ordering::SeqCst); if let Some(ref term) = restore_term { let _ = termios::tcsetattr(rfd, TCSADRAIN, term); } }).ok();
-
-        let result = interact_inner(socket_path, id, &sigint, stream);
-
-        if let Some(ref term) = old_term { let _ = termios::tcsetattr(stdin_fd, TCSADRAIN, term); }
-        result
-    }
+    interact_rl(stream)
 }
 
 // ── Rustyline interact (target sessions) ────────────────────────────────────
@@ -64,10 +46,6 @@ fn interact_rl(mut stream: std::os::unix::net::UnixStream) -> Result<()> {
     use rustyline::DefaultEditor; use rustyline::error::ReadlineError;
 
     let mut rl = DefaultEditor::new().map_err(|e| anyhow::anyhow!("Failed to create rustyline editor: {}", e))?;
-    let history_path = std::env::var("HOME").map(|h| std::path::PathBuf::from(h).join(".ww_history.txt"))
-        .unwrap_or_else(|_| std::path::PathBuf::from(".ww_history.txt"));
-    if let Some(dir) = history_path.parent() { let _ = std::fs::create_dir_all(dir); }
-    let _ = rl.load_history(&history_path);
 
     println!("Entering target interactive mode (Ctrl+C to detach)");
 
@@ -89,7 +67,7 @@ fn interact_rl(mut stream: std::os::unix::net::UnixStream) -> Result<()> {
     loop { match rx.try_recv() { Ok(data) => { std::io::stdout().write_all(&data).ok(); std::io::stdout().flush().ok(); } Err(TryRecvError::Empty) => break, _ => break, } }
 
     loop {
-        match rl.readline("> ") {
+        match rl.readline(">> ") {
             Ok(line) => {
                 let trimmed = line.trim().to_string();
                 if trimmed.is_empty() { continue; }
@@ -110,7 +88,6 @@ fn interact_rl(mut stream: std::os::unix::net::UnixStream) -> Result<()> {
         }
     }
 
-    let _ = rl.append_history(&history_path);
     Ok(())
 }
 
