@@ -371,12 +371,11 @@ fn cmd_targ_download(socket_path: &str, id: u32, remote: &str, local: Option<&st
     let file_size = u64::from_le_bytes(size_buf) as usize;
 
     let mut file_data = vec![0u8; file_size];
-    if file_size > 0 {
-        if stream.read_exact(&mut file_data).is_err() {
+    if file_size > 0
+        && stream.read_exact(&mut file_data).is_err() {
             eprintln!("Error: failed to read file data");
             return Ok(());
         }
-    }
 
     // Determine local path
     let local_path = match local {
@@ -500,7 +499,7 @@ fn cmd_interact(socket_path: &str, id: u32) -> Result<()> {
                 }
             }
             Err(ReadlineError::Interrupted) => {
-                println!("");
+                println!();
                 break;
             }
             Err(ReadlineError::Eof) => break,

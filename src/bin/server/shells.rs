@@ -67,7 +67,7 @@ pub async fn smart_listener(manager: Arc<Mutex<SessionManager>>, host: &str, por
                     // Send handshake response
                     let session_id = uuid::Uuid::new_v4().to_string();
                     let resp = protocol::Handshake::new_server(session_id);
-                    match {
+                    let res = {
                         let mg = mgr.lock().await;
                         match mg.sessions.get(&id) {
                             Some(ManagedSession::Smart(s)) => {
@@ -76,7 +76,7 @@ pub async fn smart_listener(manager: Arc<Mutex<SessionManager>>, host: &str, por
                             }
                             _ => Ok(()),
                         }
-                    } {
+                    }; match res {
                         Ok(_) => eprintln!("[+] [ww-target] Session #{} from {} ({})", id, addr, hs.hostname.as_deref().unwrap_or("?")),
                         Err(e) => { eprintln!("[-] Failed to send handshake to #{}: {}", id, e); return; }
                     }

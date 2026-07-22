@@ -13,7 +13,7 @@ use wirewrench::target::protocol;
 use wirewrench::{Command, Response};
 
 use super::frame;
-use super::session::{ManagedSession, SessionManager};
+use super::session::{CtrlQueue, ManagedSession, SessionManager};
 use super::shells;
 
 // ── Shared types for file-transfer commands ────────────────────────────────
@@ -28,7 +28,7 @@ fn def_timeout() -> f64 { 30.0 }
 
 struct SmartTransfer {
     writer: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
-    ctrl_queue: Arc<Mutex<std::collections::VecDeque<(u8, Vec<u8>)>>>,
+    ctrl_queue: CtrlQueue,
     ift: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
 }

@@ -11,6 +11,9 @@ use wirewrench::ShellInfo;
 
 use super::frame;
 
+/// Control-message queue: (message_type, payload) pairs from a ww-target session.
+pub type CtrlQueue = Arc<Mutex<std::collections::VecDeque<(u8, Vec<u8>)>>>;
+
 // ── TCP shell session (dumb reverse shell) ────────────────────────────────
 
 pub struct ShellSession {
@@ -70,7 +73,7 @@ pub struct SmartSession {
     created: f64,
     pub writer: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
     pub shell_buf: Arc<Mutex<Vec<u8>>>,
-    pub ctrl_queue: Arc<Mutex<std::collections::VecDeque<(u8, Vec<u8>)>>>,
+    pub ctrl_queue: CtrlQueue,
     pub alive: Arc<AtomicBool>,
     pub in_file_transfer: Arc<AtomicBool>,
     _reader_handle: tokio::task::JoinHandle<()>,
@@ -82,7 +85,7 @@ impl SmartSession {
         let writer = Arc::new(Mutex::new(writer));
         let alive = Arc::new(AtomicBool::new(true));
         let shell_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-        let ctrl_queue: Arc<Mutex<std::collections::VecDeque<(u8, Vec<u8>)>>> = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let ctrl_queue: CtrlQueue = Arc::new(Mutex::new(std::collections::VecDeque::new()));
         let in_file_transfer = Arc::new(AtomicBool::new(false));
 
         let shell_clone = Arc::clone(&shell_buf);
