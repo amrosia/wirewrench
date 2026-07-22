@@ -167,7 +167,6 @@ async fn send_handler(
 ) -> Result<()> {
     let id = cmd.id.unwrap_or(0);
     let command = cmd.data.unwrap_or_default().trim().to_string();
-    let wait = cmd.wait.unwrap_or(false);
     let timeout = cmd.timeout.unwrap_or(3.0);
 
     // Single lock — look up session and dispatch
@@ -185,7 +184,7 @@ async fn send_handler(
                 let mut w = s.writer.lock().await;
                 frame::write_frame(&mut *w, protocol::FRAME_SHELL, to_send.as_bytes()).await?;
             }
-            let resp = respond_read(&s.shell_buf, wait, timeout).await;
+            let resp = respond_read(&s.shell_buf, timeout).await;
             respond_json(stream, &resp).await
         }
         Some(ManagedSession::Tcp(s, b)) => {
@@ -194,7 +193,7 @@ async fn send_handler(
                 let mut w = s.writer.lock().await;
                 w.write_all(to_send.as_bytes()).await?;
             }
-            let resp = respond_read(b, wait, timeout).await;
+            let resp = respond_read(b, timeout).await;
             respond_json(stream, &resp).await
         }
         #[cfg(feature = "web")]
@@ -207,17 +206,9 @@ async fn send_handler(
                 headers: s.headers.clone(),
                 cookie: s.cookie.clone(),
             };
-            let buf = Arc::clone(&s.buf);
             drop(mg);
             match shells::web_shell_exec(&config, &command).await {
-                Ok(body) => {
-                    if wait {
-                        respond_json(stream, &Response::with_output(body)).await
-                    } else {
-                        *buf.lock().await = body.into_bytes();
-                        respond_json(stream, &Response::ok()).await
-                    }
-                }
+                Ok(body) => respond_json(stream, &Response::with_output(body)).await,
                 Err(e) => respond_json(stream, &Response::error(e.to_string())).await,
             }
         }
@@ -747,12 +738,6 @@ async fn interact_handler(
 
 // ── Shared helper ───────────────────────────────────────────────────────────
 
-/// Build the appropriate success response based on `wait`.
-async fn respond_read(buf: &Mutex<Vec<u8>>, wait: bool, timeout: f64) -> Response {
-    if wait {
-        Response::with_output(shells::read_from_buf(buf, timeout).await)
-    } else {
-        let _ = shells::read_from_buf(buf, 0.3).await;
-        Response::ok()
-    }
+async fn respond_read(buf: &Mutex<Vec<u8>>, timeout: f64) -> Response {
+    Response::with_output(shells::read_from_buf(buf, timeout).await)
 }

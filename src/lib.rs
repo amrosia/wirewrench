@@ -26,7 +26,6 @@ pub struct Command {
     pub id: Option<u32>,
     pub data: Option<String>,
     pub timeout: Option<f64>,
-    pub wait: Option<bool>,
 }
 
 #[derive(Serialize)]

@@ -169,7 +169,7 @@ fn cmd_list(socket_path: &str) -> Result<()> {
 fn cmd_send(socket_path: &str, id: u32, command: &str, timeout: f64) -> Result<()> {
     let resp = send_cmd(socket_path, &serde_json::json!({
         "action": "send", "id": id, "data": format!("{}\n", command),
-        "wait": true, "timeout": timeout
+        "timeout": timeout
     }))?;
     if resp["status"] == "error" {
         let msg = resp["message"].as_str().unwrap_or("Unknown");
