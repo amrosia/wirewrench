@@ -6,23 +6,23 @@
 //! Frame types:
 //!   0x01 SHELL      — shell stdin/stdout bytes
 //!   0x02 HANDSHAKE  — initial identity exchange
-//!   0x03 FILE_CTRL  — file transfer coordination (JSON)
-//!   0x04 FILE_DATA  — raw file bytes (push)
+//!   0x03 `FILE_CTRL`  — file transfer coordination (JSON)
+//!   0x04 `FILE_DATA`  — raw file bytes (push)
 //!   0x05 CANCEL     — abort file transfer
 //!   0x06 HASH       — SHA-256 hash verification (JSON)
 //!   0x07 KEEPALIVE  — heartbeat
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead as _, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use core::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context as _, Result};
 use clap::Parser;
 
-use sha2::Digest;
-use wirewrench::target::protocol::*;
+use sha2::Digest as _;
+use wirewrench::target::protocol::{FRAME_SHELL, FRAME_HANDSHAKE, Handshake, FRAME_FILE_CTRL, FRAME_CANCEL, FRAME_HASH, FRAME_KEEPALIVE, PushReady, FRAME_FILE_DATA, PushError, PushVerified, PullMeta, PushDone};
 
 #[derive(Parser)]
 #[command(name = "ww-target")]
@@ -40,7 +40,7 @@ struct Args {
 
 fn write_frame(w: &mut impl Write, frame_type: u8, payload: &[u8]) -> Result<()> {
     w.write_all(&[frame_type])?;
-    w.write_all(&(payload.len() as u32).to_le_bytes())?;
+    w.write_all(&u32::try_from(payload.len())?.to_le_bytes())?;
     if !payload.is_empty() {
         w.write_all(payload)?;
     }
@@ -49,11 +49,11 @@ fn write_frame(w: &mut impl Write, frame_type: u8, payload: &[u8]) -> Result<()>
 }
 
 fn read_frame(r: &mut impl Read) -> Result<(u8, Vec<u8>)> {
-    let mut header = [0u8; 5];
+    let mut header = [0_u8; 5];
     r.read_exact(&mut header)?;
     let frame_type = header[0];
     let len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
-    let mut payload = vec![0u8; len];
+    let mut payload = vec![0_u8; len];
     if len > 0 {
         r.read_exact(&mut payload)?;
     }
@@ -67,8 +67,8 @@ fn write_json_frame(w: &mut impl Write, frame_type: u8, value: &impl serde::Seri
 
 // ── Pipe forwarder ──────────────────────────────────────────────────────────
 
-/// Spawn a thread that reads lines from `reader` and sends them as FRAME_SHELL packets.
-fn spawn_pipe_to_frames<R: Read + Send + 'static>(reader: R, writer: impl Write + Send + 'static) {
+/// Spawn a thread that reads lines from `reader` and sends them as `FRAME_SHELL` packets.
+fn spawn_pipe_to_frames<R>(reader: R, writer: impl Write + Send + 'static) where R: Read + Send + 'static {
     thread::spawn(move || {
         let mut reader = BufReader::new(reader);
         let mut w = writer;
@@ -76,11 +76,10 @@ fn spawn_pipe_to_frames<R: Read + Send + 'static>(reader: R, writer: impl Write 
         loop {
             buf.clear();
             match reader.read_until(b'\n', &mut buf) {
-                Ok(0) => break,
+                Ok(0) | Err(_) => break,
                 Ok(_) => {
                     let _ = write_frame(&mut w, FRAME_SHELL, &buf);
                 }
-                Err(_) => break,
             }
         }
     });
@@ -88,7 +87,7 @@ fn spawn_pipe_to_frames<R: Read + Send + 'static>(reader: R, writer: impl Write 
 
 // ── Session ─────────────────────────────────────────────────────────────────
 
-fn run_session(stream: TcpStream) -> Result<()> {
+fn run_session(stream: &TcpStream) -> Result<()> {
     stream.set_read_timeout(None)?;
     let mut reader = stream.try_clone()?;
     let mut writer = stream.try_clone()?;
@@ -99,7 +98,7 @@ fn run_session(stream: TcpStream) -> Result<()> {
     write_json_frame(&mut writer, FRAME_HANDSHAKE, &Handshake::new_client(hostname, platform))?;
 
     let (ftype, payload) = read_frame(&mut reader)?;
-    anyhow::ensure!(ftype == FRAME_HANDSHAKE, "Expected handshake, got frame type {}", ftype);
+    anyhow::ensure!(ftype == FRAME_HANDSHAKE, "Expected handshake, got frame type {ftype}");
     let resp: Handshake = serde_json::from_slice(&payload)
         .context("Invalid handshake response")?;
     eprintln!("[+] Connected. Session ID: {}", resp.session_id.as_deref().unwrap_or("?"));
@@ -125,7 +124,7 @@ fn run_session(stream: TcpStream) -> Result<()> {
         let (ftype, payload) = match read_frame(&mut reader) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("[-] Read error: {}", e);
+                eprintln!("[-] Read error: {e}");
                 break;
             }
         };
@@ -144,23 +143,23 @@ fn run_session(stream: TcpStream) -> Result<()> {
                 let msg: serde_json::Value = match serde_json::from_slice(&payload) {
                     Ok(v) => v,
                     Err(e) => {
-                        eprintln!("[-] Invalid FILE_CTRL JSON: {}", e);
+                        eprintln!("[-] Invalid FILE_CTRL JSON: {e}");
                         continue;
                     }
                 };
                 match msg["type"].as_str().unwrap_or("") {
                     "push_start" => {
-                        let path = msg["path"].as_str().unwrap_or("").to_string();
+                        let path = msg["path"].as_str().unwrap_or("").to_owned();
                         let size = msg["size"].as_u64().unwrap_or(0);
-                        let expected = msg["hash"].as_str().unwrap_or("").to_string();
+                        let expected = msg["hash"].as_str().unwrap_or("").to_owned();
                         if let Err(e) = handle_push(&mut reader, &mut writer, &path, size, &expected) {
-                            eprintln!("[-] push error: {}", e);
+                            eprintln!("[-] push error: {e}");
                         }
                     }
                     "pull" => {
-                        let path = msg["path"].as_str().unwrap_or("").to_string();
+                        let path = msg["path"].as_str().unwrap_or("").to_owned();
                         if let Err(e) = handle_pull(&mut writer, &path) {
-                            eprintln!("[-] pull error: {}", e);
+                            eprintln!("[-] pull error: {e}");
                         }
                     }
                     _ => {}
@@ -171,14 +170,11 @@ fn run_session(stream: TcpStream) -> Result<()> {
                 // For now, just continue — the current push/pull handler will
                 // fail when it can't read the expected frames
             }
-            FRAME_HASH => {
-                // Ignore (handled inside push/pull handlers)
-            }
-            FRAME_KEEPALIVE => {
-                // Ignore
+            FRAME_HASH | FRAME_KEEPALIVE => {
+                // Ignore (handled inside push/pull handlers for HASH)
             }
             _ => {
-                eprintln!("[-] Unknown frame type: {}", ftype);
+                eprintln!("[-] Unknown frame type: {ftype}");
             }
         }
     }
@@ -193,11 +189,12 @@ fn run_session(stream: TcpStream) -> Result<()> {
 
 fn handle_push(reader: &mut TcpStream, writer: &mut TcpStream, path: &str, size: u64, expected: &str) -> Result<()> {
     // Acknowledge
-    write_json_frame(writer, FRAME_HASH, &PushReady::new(path.to_string()))?;
+    write_json_frame(writer, FRAME_HASH, &PushReady::new(path.to_owned()))?;
 
     // Read FILE_DATA frames until we have all bytes
-    let mut data = Vec::with_capacity(size as usize);
-    while data.len() < size as usize {
+    let data_cap: usize = size.try_into()?;
+    let mut data = Vec::with_capacity(data_cap);
+    while data.len() < data_cap {
         let (ftype, payload) = read_frame(reader)?;
         match ftype {
             FRAME_FILE_DATA => {
@@ -205,7 +202,7 @@ fn handle_push(reader: &mut TcpStream, writer: &mut TcpStream, path: &str, size:
             }
             FRAME_CANCEL => {
                 let _ = write_json_frame(writer, FRAME_FILE_CTRL,
-                    &PushError::new(path.to_string(), "Cancelled by server".into()));
+                    &PushError::new(path.to_owned(), "Cancelled by server".into()));
                 return Ok(());
             }
             FRAME_HASH => {
@@ -216,7 +213,7 @@ fn handle_push(reader: &mut TcpStream, writer: &mut TcpStream, path: &str, size:
                 }
             }
             _ => {
-                eprintln!("[-] Unexpected frame type {} during push", ftype);
+                eprintln!("[-] Unexpected frame type {ftype} during push");
             }
         }
     }
@@ -228,7 +225,7 @@ fn handle_push(reader: &mut TcpStream, writer: &mut TcpStream, path: &str, size:
 
     if actual != expected {
         let _ = write_json_frame(writer, FRAME_FILE_CTRL,
-            &PushError::new(path.to_string(), format!("Hash mismatch: expected {}, got {}", expected, actual)));
+            &PushError::new(path.to_owned(), format!("Hash mismatch: expected {expected}, got {actual}")));
         return Ok(());
     }
 
@@ -238,12 +235,12 @@ fn handle_push(reader: &mut TcpStream, writer: &mut TcpStream, path: &str, size:
     }
     if let Err(e) = std::fs::write(path, &data) {
         let _ = write_json_frame(writer, FRAME_FILE_CTRL,
-            &PushError::new(path.to_string(), format!("Write error: {}", e)));
+            &PushError::new(path.to_owned(), format!("Write error: {e}")));
         return Ok(());
     }
 
     write_json_frame(writer, FRAME_HASH, &PushVerified::new(actual))?;
-    eprintln!("[+] Received '{}' ({})", path, expected);
+    eprintln!("[+] Received '{path}' ({expected})");
     Ok(())
 }
 
@@ -254,7 +251,7 @@ fn handle_pull(writer: &mut TcpStream, path: &str) -> Result<()> {
         Ok(d) => d,
         Err(e) => {
             let _ = write_json_frame(writer, FRAME_FILE_CTRL,
-                &PushError::new(path.to_string(), format!("Read error: {}", e)));
+                &PushError::new(path.to_owned(), format!("Read error: {e}")));
             return Ok(());
         }
     };
@@ -265,7 +262,7 @@ fn handle_pull(writer: &mut TcpStream, path: &str) -> Result<()> {
     let hash = format!("{:x}", h.finalize());
 
     // Send metadata
-    write_json_frame(writer, FRAME_FILE_CTRL, &PullMeta::new(path.to_string(), size, hash.clone()))?;
+    write_json_frame(writer, FRAME_FILE_CTRL, &PullMeta::new(path.to_owned(), size, hash.clone()))?;
 
     // Send file data in chunks
     for chunk in data.chunks(8192) {
@@ -274,7 +271,7 @@ fn handle_pull(writer: &mut TcpStream, path: &str) -> Result<()> {
 
     // Send done
     write_json_frame(writer, FRAME_HASH, &PushDone::new(hash))?;
-    eprintln!("[+] Sent '{}' ({} bytes)", path, size);
+    eprintln!("[+] Sent '{path}' ({size} bytes)");
     Ok(())
 }
 
@@ -284,15 +281,15 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let addr = format!("{}:{}", args.host, args.port);
     loop {
-        eprintln!("[+] Connecting to {} ...", addr);
+        eprintln!("[+] Connecting to {addr} ...");
         match TcpStream::connect(&addr) {
             Ok(stream) => {
-                if let Err(e) = run_session(stream) {
-                    eprintln!("[-] Session error: {}", e);
+                if let Err(e) = run_session(&stream) {
+                    eprintln!("[-] Session error: {e}");
                 }
             }
             Err(e) => {
-                eprintln!("[-] Connection failed: {}", e);
+                eprintln!("[-] Connection failed: {e}");
             }
         }
         if args.no_reconnect {

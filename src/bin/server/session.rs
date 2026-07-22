@@ -11,7 +11,7 @@ use wirewrench::ShellInfo;
 
 use super::frame;
 
-/// Control-message queue: (message_type, payload) pairs from a ww-target session.
+/// Control-message queue: (`message_type`, payload) pairs from a ww-target session.
 pub type CtrlQueue = Arc<Mutex<std::collections::VecDeque<(u8, Vec<u8>)>>>;
 
 // ── TCP shell session (dumb reverse shell) ────────────────────────────────
@@ -22,7 +22,7 @@ pub struct ShellSession {
     created: f64,
     pub alive: Arc<AtomicBool>,
     pub writer: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
-    _reader_handle: tokio::task::JoinHandle<()>,
+    reader_handle: tokio::task::JoinHandle<()>,
 }
 
 impl ShellSession {
@@ -38,9 +38,8 @@ impl ShellSession {
             let mut tmp = vec![0u8; 65536];
             loop {
                 match r.read(&mut tmp).await {
-                    Ok(0) => { alive_clone.store(false, Ordering::SeqCst); break; }
+                    Ok(0) | Err(_) => { alive_clone.store(false, Ordering::SeqCst); break; }
                     Ok(n) => { let mut b = buf_clone.lock().await; b.extend_from_slice(&tmp[..n]); }
-                    Err(_) => { alive_clone.store(false, Ordering::SeqCst); break; }
                 }
             }
         });
@@ -50,7 +49,7 @@ impl ShellSession {
             created: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(),
             alive: Arc::clone(&alive),
             writer: Arc::new(Mutex::new(writer)),
-            _reader_handle: reader_handle,
+            reader_handle,
         };
         (session, buf)
     }
@@ -61,7 +60,7 @@ impl ShellSession {
 
     pub fn close(&mut self) {
         self.alive.store(false, Ordering::SeqCst);
-        self._reader_handle.abort();
+        self.reader_handle.abort();
     }
 }
 
@@ -76,7 +75,7 @@ pub struct SmartSession {
     pub ctrl_queue: CtrlQueue,
     pub alive: Arc<AtomicBool>,
     pub in_file_transfer: Arc<AtomicBool>,
-    _reader_handle: tokio::task::JoinHandle<()>,
+    reader_handle: tokio::task::JoinHandle<()>,
 }
 
 impl SmartSession {
@@ -96,10 +95,7 @@ impl SmartSession {
         let reader_handle = tokio::spawn(async move {
             let mut r = reader;
             loop {
-                let (ftype, payload) = match frame::read_frame(&mut r).await {
-                    Ok(v) => v,
-                    Err(_) => { alive_clone.store(false, Ordering::SeqCst); break; }
-                };
+                let Ok((ftype, payload)) = frame::read_frame(&mut r).await else { alive_clone.store(false, Ordering::SeqCst); break; };
                 match ftype {
                     protocol::FRAME_SHELL => {
                         let mut b = shell_clone.lock().await;
@@ -109,7 +105,6 @@ impl SmartSession {
                         let mut q = ctrl_clone.lock().await;
                         q.push_back((ftype, payload));
                     }
-                    protocol::FRAME_KEEPALIVE => {}
                     protocol::FRAME_CANCEL => {
                         ift_clone.store(false, Ordering::SeqCst);
                     }
@@ -118,7 +113,7 @@ impl SmartSession {
             }
         });
 
-        Self { id, addr, created: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(), writer, shell_buf, ctrl_queue, alive, in_file_transfer, _reader_handle: reader_handle }
+        Self { id, addr, created: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(), writer, shell_buf, ctrl_queue, alive, in_file_transfer, reader_handle }
     }
 
     pub fn info(&self) -> ShellInfo {
@@ -127,7 +122,7 @@ impl SmartSession {
 
     pub fn close(&mut self) {
         self.alive.store(false, Ordering::SeqCst);
-        self._reader_handle.abort();
+        self.reader_handle.abort();
     }
 }
 
@@ -239,6 +234,6 @@ impl SessionManager {
     }
 
     pub fn list(&self) -> Vec<ShellInfo> {
-        self.sessions.values().map(|s| s.info()).collect()
+        self.sessions.values().map(ManagedSession::info).collect()
     }
 }

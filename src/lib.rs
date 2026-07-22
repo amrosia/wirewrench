@@ -42,18 +42,22 @@ pub struct Response {
 }
 
 impl Response {
+    #[must_use]
     pub fn ok() -> Self {
         Self { status: "ok".into(), message: None, shells: None, output: None, exit_code: None }
     }
     pub fn error(msg: impl Into<String>) -> Self {
         Self { status: "error".into(), message: Some(msg.into()), shells: None, output: None, exit_code: None }
     }
+    #[must_use]
     pub fn with_shells(shells: serde_json::Value) -> Self {
         Self { status: "ok".into(), message: None, shells: Some(shells), output: None, exit_code: None }
     }
+    #[must_use]
     pub fn with_output(out: String) -> Self {
         Self { status: "ok".into(), message: None, shells: None, output: Some(out), exit_code: None }
     }
+    #[must_use]
     pub fn with_output_exit(out: String, code: i32) -> Self {
         Self { status: "ok".into(), message: None, shells: None, output: Some(out), exit_code: Some(code) }
     }

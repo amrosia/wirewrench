@@ -3,7 +3,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// Write a framed packet (type + LE32 length + payload) to an async writer.
 pub async fn write_frame<W: AsyncWriteExt + Unpin>(w: &mut W, ftype: u8, payload: &[u8]) -> std::io::Result<()> {
     w.write_all(&[ftype]).await?;
-    w.write_all(&(payload.len() as u32).to_le_bytes()).await?;
+    let len: u32 = payload.len().try_into().map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "payload too large"))?;
+    w.write_all(&len.to_le_bytes()).await?;
     if !payload.is_empty() {
         w.write_all(payload).await?;
     }

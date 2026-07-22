@@ -1,5 +1,4 @@
 use std::io::{BufRead, BufReader, Read, Write};
-use std::sync::mpsc::TryRecvError;
 use std::path::Path;
 use std::time::Duration;
 
@@ -107,7 +106,7 @@ enum TargAction {
 
 fn connect(socket_path: &str) -> Result<std::os::unix::net::UnixStream> {
     let stream = std::os::unix::net::UnixStream::connect(Path::new(socket_path))
-        .with_context(|| format!("Cannot connect to '{}'. Is ww-server running?", socket_path))?;
+        .with_context(|| format!("Cannot connect to '{socket_path}'. Is ww-server running?"))?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     Ok(stream)
@@ -137,7 +136,7 @@ fn cmd_list(socket_path: &str) -> Result<()> {
     let resp = send_cmd(socket_path, &serde_json::json!({"action": "list"}))?;
     if resp["status"] == "ok" {
         let shells = &resp["shells"];
-        let arr = shells.as_array().map(|a| a.as_slice()).unwrap_or(&[]);
+        let arr = shells.as_array().map_or(&[] as &[serde_json::Value], std::vec::Vec::as_slice);
         if arr.is_empty() {
             println!("No active shells.");
         } else {
@@ -154,12 +153,12 @@ fn cmd_list(socket_path: &str) -> Result<()> {
                 let created = s["created"].as_f64().unwrap_or(0.0);
                 let age = (now - created) as u64;
                 let alive_str = if alive { "✓" } else { "✗" };
-                println!("{:<5} {:<25} {:<7} {}s", id, addr, alive_str, age);
+                println!("{id:<5} {addr:<25} {alive_str:<7} {age}s");
             }
         }
     } else {
         let msg = resp["message"].as_str().unwrap_or("Unknown error");
-        eprintln!("Error: {}", msg);
+        eprintln!("Error: {msg}");
     }
     Ok(())
 }
@@ -173,17 +172,17 @@ fn cmd_send(socket_path: &str, id: u32, command: &str, timeout: f64) -> Result<(
     }))?;
     if resp["status"] == "error" {
         let msg = resp["message"].as_str().unwrap_or("Unknown");
-        eprintln!("Error: {}", msg);
+        eprintln!("Error: {msg}");
         return Ok(());
     }
     if let Some(out) = resp["output"].as_str() {
-        if !out.is_empty() {
-            print!("{}", out);
+        if out.is_empty() {
+            eprintln!("Warning: no output received. Try increasing --timeout (-t) if you expected output.");
+        } else {
+            print!("{out}");
             if !out.ends_with('\n') {
                 println!();
             }
-        } else {
-            eprintln!("Warning: no output received. Try increasing --timeout (-t) if you expected output.");
         }
     }
     Ok(())
@@ -196,10 +195,10 @@ fn cmd_close(socket_path: &str, id: u32) -> Result<()> {
         "action": "close", "id": id
     }))?;
     if resp["status"] == "ok" {
-        println!("Shell #{} closed.", id);
+        println!("Shell #{id} closed.");
     } else {
         let msg = resp["message"].as_str().unwrap_or("Unknown error");
-        eprintln!("Error: {}", msg);
+        eprintln!("Error: {msg}");
     }
     Ok(())
 }
@@ -208,16 +207,16 @@ fn cmd_close(socket_path: &str, id: u32) -> Result<()> {
 
 fn cmd_script(socket_path: &str, id: u32, file: &str) -> Result<()> {
     let content = std::fs::read_to_string(file)
-        .with_context(|| format!("Cannot read file '{}'", file))?;
+        .with_context(|| format!("Cannot read file '{file}'"))?;
     let lines: Vec<&str> = content
         .lines()
-        .map(|l| l.trim())
+        .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .collect();
 
     println!("[+] Running {} commands on shell #{}", lines.len(), id);
     for cmd in &lines {
-        println!("\n→ {}", cmd);
+        println!("\n→ {cmd}");
         let resp = send_cmd(socket_path, &serde_json::json!({
             "action": "send", "id": id, "data": format!("{}\n", cmd)
         }))?;
@@ -232,7 +231,7 @@ fn cmd_script(socket_path: &str, id: u32, file: &str) -> Result<()> {
         if resp["status"] == "ok"
             && let Some(out) = resp["output"].as_str()
                 && !out.is_empty() {
-                    print!("{}", out);
+                    print!("{out}");
                 }
     }
     Ok(())
@@ -248,22 +247,22 @@ fn cmd_web(
     url: &str,
     injection_point: &str,
     method: &str,
-    data: &Option<String>,
+    data: Option<&str>,
     headers: &[String],
-    cookie: &Option<String>,
+    cookie: Option<&str>,
 ) -> Result<()> {
     // Validate injection point is present exactly once
-    let target = data.as_deref().unwrap_or(url);
+    let target = data.unwrap_or(url);
     let count = target.matches(injection_point).count();
     match count {
         0 => {
-            eprintln!("Error: No injection point '{}' found in '{}'", injection_point, target);
-            eprintln!("       Add '{}' to your URL or -d data string", injection_point);
+            eprintln!("Error: No injection point '{injection_point}' found in '{target}'");
+            eprintln!("       Add '{injection_point}' to your URL or -d data string");
             return Ok(());
         }
         1 => {} // ok
         _ => {
-            eprintln!("Error: Too many '{}' injection points in '{}'", injection_point, target);
+            eprintln!("Error: Too many '{injection_point}' injection points in '{target}'");
             return Ok(());
         }
     }
@@ -285,11 +284,11 @@ fn cmd_web(
 
     if resp["status"] == "ok" {
         let id = resp["shells"]["id"].as_u64().unwrap_or(0);
-        println!("[+] Web shell registered as session #{}", id);
-        println!("[+] Use 'ww send {} \"command\"' or 'ww interact {}'", id, id);
+        println!("[+] Web shell registered as session #{id}");
+        println!("[+] Use 'ww send {id} \"command\"' or 'ww interact {id}'");
     } else {
         let msg = resp["message"].as_str().unwrap_or("Unknown error");
-        eprintln!("Error: {}", msg);
+        eprintln!("Error: {msg}");
     }
 
     Ok(())
@@ -299,14 +298,12 @@ fn cmd_web(
 
 fn cmd_targ_upload(socket_path: &str, id: u32, local: &str, remote: Option<&str>, timeout: f64) -> Result<()> {
     let file_data = std::fs::read(local)
-        .with_context(|| format!("Cannot read file '{}'", local))?;
+        .with_context(|| format!("Cannot read file '{local}'"))?;
     let size = file_data.len();
 
     let remote_path = match remote {
         Some(p) => p.to_string(),
-        None => std::path::Path::new(local).file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| local.to_string()),
+        None => std::path::Path::new(local).file_name().map_or_else(|| local.to_string(), |n| n.to_string_lossy().into_owned()),
     };
 
     let push_data = serde_json::json!({"path": remote_path, "size": size, "timeout": timeout});
@@ -327,7 +324,7 @@ fn cmd_targ_upload(socket_path: &str, id: u32, local: &str, remote: Option<&str>
         println!("{}", resp["output"].as_str().unwrap_or("Upload completed"));
     } else {
         let msg = resp["message"].as_str().unwrap_or("Unknown error");
-        eprintln!("Error: {}", msg);
+        eprintln!("Error: {msg}");
     }
     Ok(())
 }
@@ -352,13 +349,10 @@ fn cmd_targ_download(socket_path: &str, id: u32, remote: &str, local: Option<&st
         if byte[0] == b'\n' { break; }
         resp_buf.push(byte[0]);
     }
-    let resp: Value = match serde_json::from_slice(&resp_buf) {
-        Ok(v) => v,
-        Err(_) => { eprintln!("Error: invalid response from server"); return Ok(()); }
-    };
+    let resp: Value = if let Ok(v) = serde_json::from_slice(&resp_buf) { v } else { eprintln!("Error: invalid response from server"); return Ok(()); };
     if resp["status"] != "ok" {
         let msg = resp["message"].as_str().unwrap_or("Unknown error");
-        eprintln!("Error: {}", msg);
+        eprintln!("Error: {msg}");
         return Ok(());
     }
 
@@ -368,7 +362,7 @@ fn cmd_targ_download(socket_path: &str, id: u32, remote: &str, local: Option<&st
         eprintln!("Error: failed to read file size");
         return Ok(());
     }
-    let file_size = u64::from_le_bytes(size_buf) as usize;
+    let file_size: usize = u64::from_le_bytes(size_buf).try_into()?;
 
     let mut file_data = vec![0u8; file_size];
     if file_size > 0
@@ -380,14 +374,12 @@ fn cmd_targ_download(socket_path: &str, id: u32, remote: &str, local: Option<&st
     // Determine local path
     let local_path = match local {
         Some(p) => p.to_string(),
-        None => std::path::Path::new(remote).file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "downloaded".to_string()),
+        None => std::path::Path::new(remote).file_name().map_or_else(|| "downloaded".to_string(), |n| n.to_string_lossy().into_owned()),
     };
 
     // Write to file
     std::fs::write(&local_path, &file_data)
-        .with_context(|| format!("Failed to write '{}'", local_path))?;
+        .with_context(|| format!("Failed to write '{local_path}'"))?;
 
     println!("{}", resp["output"].as_str().unwrap_or("Download completed"));
     Ok(())
@@ -398,10 +390,10 @@ fn cmd_targ_download(socket_path: &str, id: u32, remote: &str, local: Option<&st
 fn cmd_targ_cancel(socket_path: &str, id: u32) -> Result<()> {
     let resp = send_cmd(socket_path, &serde_json::json!({"action":"targ_cancel","id":id}))?;
     if resp["status"] == "ok" {
-        println!("Cancel sent for session #{}", id);
+        println!("Cancel sent for session #{id}");
     } else {
         let msg = resp["message"].as_str().unwrap_or("Unknown error");
-        eprintln!("Error: {}", msg);
+        eprintln!("Error: {msg}");
     }
     Ok(())
 }
@@ -411,7 +403,6 @@ fn cmd_targ_cancel(socket_path: &str, id: u32) -> Result<()> {
 fn cmd_interact(socket_path: &str, id: u32) -> Result<()> {
     use rustyline::DefaultEditor;
     use rustyline::error::ReadlineError;
-    use std::sync::mpsc::RecvTimeoutError;
 
     let mut stream = send_cmd_raw(socket_path, &serde_json::json!({
         "action": "interact", "id": id
@@ -426,12 +417,12 @@ fn cmd_interact(socket_path: &str, id: u32) -> Result<()> {
     let resp: Value = serde_json::from_str(line.trim())?;
     if resp["status"] != "ok" {
         let msg = resp["message"].as_str().unwrap_or("Unknown");
-        eprintln!("Error: {}", msg);
+        eprintln!("Error: {msg}");
         return Ok(());
     }
 
     let mut rl = DefaultEditor::new()
-        .map_err(|e| anyhow::anyhow!("Failed to create rustyline editor: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to create rustyline editor: {e}"))?;
 
     println!("Entering interactive mode (Ctrl+C to detach)");
 
@@ -455,15 +446,9 @@ fn cmd_interact(socket_path: &str, id: u32) -> Result<()> {
 
     // Drain any initial output
     std::thread::sleep(Duration::from_millis(50));
-    loop {
-        match rx.try_recv() {
-            Ok(data) => {
-                std::io::stdout().write_all(&data).ok();
-                std::io::stdout().flush().ok();
-            }
-            Err(TryRecvError::Empty) => break,
-            _ => break,
-        }
+    while let Ok(data) = rx.try_recv() {
+        std::io::stdout().write_all(&data).ok();
+        std::io::stdout().flush().ok();
     }
 
     // Readline loop
@@ -475,8 +460,8 @@ fn cmd_interact(socket_path: &str, id: u32) -> Result<()> {
                     continue;
                 }
                 rl.add_history_entry(trimmed.as_str())
-                    .map_err(|e| anyhow::anyhow!("Failed to add history: {}", e))?;
-                let to_send = format!("{}\n", trimmed);
+                    .map_err(|e| anyhow::anyhow!("Failed to add history: {e}"))?;
+                let to_send = format!("{trimmed}\n");
                 if stream.write_all(to_send.as_bytes()).is_err() {
                     break;
                 }
@@ -484,18 +469,12 @@ fn cmd_interact(socket_path: &str, id: u32) -> Result<()> {
                     break;
                 }
                 // Read and print output until a short timeout
-                loop {
-                    match rx.recv_timeout(Duration::from_millis(300)) {
-                        Ok(data) => {
-                            if data.is_empty() {
-                                break;
-                            }
-                            std::io::stdout().write_all(&data).ok();
-                            std::io::stdout().flush().ok();
-                        }
-                        Err(RecvTimeoutError::Timeout) => break,
-                        Err(_) => break,
+                while let Ok(data) = rx.recv_timeout(Duration::from_millis(300)) {
+                    if data.is_empty() {
+                        break;
                     }
+                    std::io::stdout().write_all(&data).ok();
+                    std::io::stdout().flush().ok();
                 }
             }
             Err(ReadlineError::Interrupted) => {
@@ -504,7 +483,7 @@ fn cmd_interact(socket_path: &str, id: u32) -> Result<()> {
             }
             Err(ReadlineError::Eof) => break,
             Err(e) => {
-                eprintln!("Readline error: {}", e);
+                eprintln!("Readline error: {e}");
                 break;
             }
         }
@@ -534,7 +513,7 @@ fn main() -> Result<()> {
         Commands::Script { id, file } => cmd_script(&cli.socket, *id, file),
         #[cfg(feature = "web")]
         Commands::Web { url, injection_point, method, data, headers, cookie } => {
-            cmd_web(&cli.socket, url, injection_point, method, data, headers, cookie)
+            cmd_web(&cli.socket, url, injection_point, method, data.as_deref(), headers, cookie.as_deref())
         }
         Commands::Targ { action } => match action {
             TargAction::Upload { id, local, remote, timeout } => {

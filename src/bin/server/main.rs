@@ -38,9 +38,9 @@ struct Args {
 async fn control_server(manager: Arc<Mutex<SessionManager>>, socket_path: &str) -> Result<()> {
     let _ = std::fs::remove_file(socket_path);
     let listener = UnixListener::bind(socket_path)
-        .with_context(|| format!("Failed to bind Unix socket at {}", socket_path))?;
+        .with_context(|| format!("Failed to bind Unix socket at {socket_path}"))?;
     std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o777))?;
-    eprintln!("[+] Control socket at {}", socket_path);
+    eprintln!("[+] Control socket at {socket_path}");
 
     loop {
         match listener.accept().await {
@@ -48,11 +48,11 @@ async fn control_server(manager: Arc<Mutex<SessionManager>>, socket_path: &str) 
                 let mgr = Arc::clone(&manager);
                 tokio::spawn(async move {
                     if let Err(e) = handlers::handle_control(stream, mgr).await {
-                        eprintln!("[-] Control handler error: {}", e);
+                        eprintln!("[-] Control handler error: {e}");
                     }
                 });
             }
-            Err(e) => eprintln!("[-] Control accept error: {}", e),
+            Err(e) => eprintln!("[-] Control accept error: {e}"),
         }
     }
 }
@@ -68,7 +68,7 @@ async fn main() -> Result<()> {
     let host1 = args.host.clone();
     tokio::spawn(async move {
         if let Err(e) = shells::tcp_listener(mgr1, &host1, args.port).await {
-            eprintln!("[-] TCP listener error: {}", e);
+            eprintln!("[-] TCP listener error: {e}");
         }
     });
 
@@ -76,7 +76,7 @@ async fn main() -> Result<()> {
     let host2 = args.host.clone();
     tokio::spawn(async move {
         if let Err(e) = shells::smart_listener(mgr2, &host2, args.smart_port).await {
-            eprintln!("[-] Smart listener error: {}", e);
+            eprintln!("[-] Smart listener error: {e}");
         }
     });
 

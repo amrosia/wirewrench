@@ -13,10 +13,10 @@ use super::session::{ManagedSession, SessionManager};
 // ── TCP listener for dumb shells (port 4444) ──────────────────────────────
 
 pub async fn tcp_listener(manager: Arc<Mutex<SessionManager>>, host: &str, port: u16) -> Result<()> {
-    let addr = format!("{}:{}", host, port);
+    let addr = format!("{host}:{port}");
     let listener = TcpListener::bind(&addr).await
-        .with_context(|| format!("Failed to bind TCP on {}", addr))?;
-    eprintln!("[+] Listening for reverse shells on {}", addr);
+        .with_context(|| format!("Failed to bind TCP on {addr}"))?;
+    eprintln!("[+] Listening for reverse shells on {addr}");
 
     loop {
         match listener.accept().await {
@@ -25,11 +25,11 @@ pub async fn tcp_listener(manager: Arc<Mutex<SessionManager>>, host: &str, port:
                 let mgr = Arc::clone(&manager);
                 tokio::spawn(async move {
                     let id = { let mut mg = mgr.lock().await; mg.add_tcp(addr.clone(), stream) };
-                    eprintln!("[+] Shell #{} caught from {}", id, addr);
+                    eprintln!("[+] Shell #{id} caught from {addr}");
                     wait_for_disconnect(&mgr, id, None).await;
                 });
             }
-            Err(e) => eprintln!("[-] Accept error: {}", e),
+            Err(e) => eprintln!("[-] Accept error: {e}"),
         }
     }
 }
@@ -37,10 +37,10 @@ pub async fn tcp_listener(manager: Arc<Mutex<SessionManager>>, host: &str, port:
 // ── Smart listener for ww-target (port 4446) ──────────────────────────────
 
 pub async fn smart_listener(manager: Arc<Mutex<SessionManager>>, host: &str, port: u16) -> Result<()> {
-    let addr = format!("{}:{}", host, port);
+    let addr = format!("{host}:{port}");
     let listener = TcpListener::bind(&addr).await
-        .with_context(|| format!("Failed to bind smart port on {}", addr))?;
-    eprintln!("[+] Listening for ww-target on {}", addr);
+        .with_context(|| format!("Failed to bind smart port on {addr}"))?;
+    eprintln!("[+] Listening for ww-target on {addr}");
 
     loop {
         match listener.accept().await {
@@ -51,15 +51,15 @@ pub async fn smart_listener(manager: Arc<Mutex<SessionManager>>, host: &str, por
                     // Read handshake frame
                     let (ftype, payload) = match frame::read_frame(&mut stream).await {
                         Ok(v) => v,
-                        Err(e) => { eprintln!("[-] Smart handshake read error: {}", e); return; }
+                        Err(e) => { eprintln!("[-] Smart handshake read error: {e}"); return; }
                     };
                     if ftype != protocol::FRAME_HANDSHAKE {
-                        eprintln!("[-] Expected handshake from {}, got frame {}", addr, ftype);
+                        eprintln!("[-] Expected handshake from {addr}, got frame {ftype}");
                         return;
                     }
                     let hs: protocol::Handshake = match serde_json::from_slice(&payload) {
                         Ok(h) => h,
-                        Err(e) => { eprintln!("[-] Invalid handshake from {}: {}", addr, e); return; }
+                        Err(e) => { eprintln!("[-] Invalid handshake from {addr}: {e}"); return; }
                     };
 
                     let id = { let mut mg = mgr.lock().await; mg.add_smart(addr.clone(), stream) };
@@ -77,14 +77,14 @@ pub async fn smart_listener(manager: Arc<Mutex<SessionManager>>, host: &str, por
                             _ => Ok(()),
                         }
                     }; match res {
-                        Ok(_) => eprintln!("[+] [ww-target] Session #{} from {} ({})", id, addr, hs.hostname.as_deref().unwrap_or("?")),
-                        Err(e) => { eprintln!("[-] Failed to send handshake to #{}: {}", id, e); return; }
+                        Ok(()) => eprintln!("[+] [ww-target] Session #{} from {} ({})", id, addr, hs.hostname.as_deref().unwrap_or("?")),
+                        Err(e) => { eprintln!("[-] Failed to send handshake to #{id}: {e}"); return; }
                     }
 
                     wait_for_disconnect(&mgr, id, Some("target")).await;
                 });
             }
-            Err(e) => eprintln!("[-] Smart accept error: {}", e),
+            Err(e) => eprintln!("[-] Smart accept error: {e}"),
         }
     }
 }
@@ -92,7 +92,7 @@ pub async fn smart_listener(manager: Arc<Mutex<SessionManager>>, host: &str, por
 /// Wait for a session to become dead, then remove it.
 async fn wait_for_disconnect(manager: &Arc<Mutex<SessionManager>>, id: u32, kind: Option<&str>) {
     loop {
-        let alive = { let mg = manager.lock().await; mg.sessions.get(&id).map(|s| s.alive()).unwrap_or(false) };
+        let alive = { let mg = manager.lock().await; mg.sessions.get(&id).is_some_and(super::session::ManagedSession::alive) };
         if !alive { break; }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -101,8 +101,8 @@ async fn wait_for_disconnect(manager: &Arc<Mutex<SessionManager>>, id: u32, kind
         mg.remove(id);
     }
     match kind {
-        Some(k) => eprintln!("[-] [ww-{}] Session #{} disconnected", k, id),
-        None => eprintln!("[-] Shell #{} disconnected", id),
+        Some(k) => eprintln!("[-] [ww-{k}] Session #{id} disconnected"),
+        None => eprintln!("[-] Shell #{id} disconnected"),
     }
 }
 
@@ -149,7 +149,7 @@ pub async fn read_ctrl_queue_msg(
     q: &Mutex<std::collections::VecDeque<(u8, Vec<u8>)>>,
     timeout: f64,
 ) -> Option<(u8, Vec<u8>)> {
-    poll_with_timeout(q, timeout, |q| q.pop_front()).await
+    poll_with_timeout(q, timeout, std::collections::VecDeque::pop_front).await
 }
 
 // ── Web shell HTTP helpers ─────────────────────────────────────────────────
@@ -161,7 +161,7 @@ fn url_encode(input: &str) -> String {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => result.push(byte as char),
             b' ' => result.push_str("%20"),
-            _ => result.push_str(&format!("%{:02X}", byte)),
+            _ => { let _ = std::fmt::write(&mut result, format_args!("%{byte:02X}")); },
         }
     }
     result

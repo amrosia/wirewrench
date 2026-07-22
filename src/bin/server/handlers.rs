@@ -145,7 +145,7 @@ pub async fn handle_control(
             let config: wirewrench::WebShellConfig = match serde_json::from_str(&cmd.data.unwrap_or_default()) {
                 Ok(c) => c,
                 Err(e) => {
-                    respond_json(&mut stream, &Response::error(format!("Invalid config: {}", e))).await?;
+                    respond_json(&mut stream, &Response::error(format!("Invalid config: {e}"))).await?;
                     return Ok(());
                 }
             };
@@ -153,7 +153,7 @@ pub async fn handle_control(
             respond_json(&mut stream, &Response::with_shells(json!({"id": id}))).await?;
         }
         "interact" => interact_handler(cmd, &manager, &mut stream).await?,
-        _ => respond_json(&mut stream, &Response::error(format!("Unknown action: {}", action))).await?,
+        _ => respond_json(&mut stream, &Response::error(format!("Unknown action: {action}"))).await?,
     }
     Ok(())
 }
@@ -179,7 +179,7 @@ async fn send_handler(
             if s.in_file_transfer.load(Ordering::SeqCst) {
                 return respond_json(stream, &Response::error("Session busy with file transfer")).await;
             }
-            let to_send = format!("{}\n", command);
+            let to_send = format!("{command}\n");
             {
                 let mut w = s.writer.lock().await;
                 frame::write_frame(&mut *w, protocol::FRAME_SHELL, to_send.as_bytes()).await?;
@@ -188,7 +188,7 @@ async fn send_handler(
             respond_json(stream, &resp).await
         }
         Some(ManagedSession::Tcp(s, b)) => {
-            let to_send = format!("{}\n", command);
+            let to_send = format!("{command}\n");
             {
                 let mut w = s.writer.lock().await;
                 w.write_all(to_send.as_bytes()).await?;
@@ -257,19 +257,16 @@ async fn push_handler(
     let pc: PushCommand = match serde_json::from_str(&cmd.data.unwrap_or_default()) {
         Ok(p) => p,
         Err(e) => {
-            respond_error(stream, format!("Invalid push: {}", e)).await;
+            respond_error(stream, format!("Invalid push: {e}")).await;
             return Ok(());
         }
     };
 
-    let transfer = match prepare_smart_transfer(id, manager, stream, Some("Push only supported on smart (ww-target) sessions")).await? {
-        Some(t) => t,
-        None => return Ok(()),
-    };
+    let Some(transfer) = prepare_smart_transfer(id, manager, stream, Some("Push only supported on smart (ww-target) sessions")).await? else { return Ok(()) };
     let SmartTransfer { writer, ctrl_queue, ift, alive: _ } = transfer;
 
     // Read file data from control socket
-    let size = pc.size as usize;
+    let size: usize = pc.size.try_into()?;
     let mut data = Vec::with_capacity(size);
     let fb = buffered.len().min(size);
     if fb > 0 {
@@ -278,7 +275,7 @@ async fn push_handler(
     if size > fb {
         let mut raw = stream
             .try_clone()
-            .map_err(|e| anyhow::anyhow!("clone: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("clone: {e}"))?;
         raw.set_read_timeout(Some(Duration::from_secs(30)))?;
         let mut rest = vec![0u8; size - fb];
         raw.read_exact(&mut rest)?;
@@ -299,20 +296,14 @@ async fn push_handler(
     }
 
     // Wait for push_ready
-    let _ready = match shells::read_ctrl_queue_msg(&ctrl_queue, pc.timeout).await {
-        Some((_, p)) => match serde_json::from_slice::<serde_json::Value>(&p) {
-            Ok(v) => v,
-            Err(_) => {
-                ift.store(false, Ordering::SeqCst);
-                respond_error(stream, "Invalid push_ready response").await;
-                return Ok(());
-            }
-        },
-        None => {
-            ift.store(false, Ordering::SeqCst);
-            respond_error(stream, "Push ready timeout").await;
-            return Ok(());
-        }
+    let _ready = if let Some((_, p)) = shells::read_ctrl_queue_msg(&ctrl_queue, pc.timeout).await { if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&p) { v } else {
+        ift.store(false, Ordering::SeqCst);
+        respond_error(stream, "Invalid push_ready response").await;
+        return Ok(());
+    } } else {
+        ift.store(false, Ordering::SeqCst);
+        respond_error(stream, "Push ready timeout").await;
+        return Ok(());
     };
 
     // Send file data in chunks
@@ -330,20 +321,14 @@ async fn push_handler(
     }
 
     // Wait for verification
-    let resp_v = match shells::read_ctrl_queue_msg(&ctrl_queue, pc.timeout).await {
-        Some((_, p)) => match serde_json::from_slice::<serde_json::Value>(&p) {
-            Ok(v) => v,
-            Err(_) => {
-                ift.store(false, Ordering::SeqCst);
-                respond_error(stream, "Invalid push verify response").await;
-                return Ok(());
-            }
-        },
-        None => {
-            ift.store(false, Ordering::SeqCst);
-            respond_error(stream, "Push verify timeout").await;
-            return Ok(());
-        }
+    let resp_v = if let Some((_, p)) = shells::read_ctrl_queue_msg(&ctrl_queue, pc.timeout).await { if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&p) { v } else {
+        ift.store(false, Ordering::SeqCst);
+        respond_error(stream, "Invalid push verify response").await;
+        return Ok(());
+    } } else {
+        ift.store(false, Ordering::SeqCst);
+        respond_error(stream, "Push verify timeout").await;
+        return Ok(());
     };
 
     if resp_v["type"] == "push_verified" {
@@ -376,15 +361,12 @@ async fn pull_handler(
     let pc: PullCommand = match serde_json::from_str(&cmd.data.unwrap_or_default()) {
         Ok(p) => p,
         Err(e) => {
-            respond_error(stream, format!("Invalid pull: {}", e)).await;
+            respond_error(stream, format!("Invalid pull: {e}")).await;
             return Ok(());
         }
     };
 
-    let transfer = match prepare_smart_transfer(id, manager, stream, Some("Smart session required")).await? {
-        Some(t) => t,
-        None => return Ok(()),
-    };
+    let Some(transfer) = prepare_smart_transfer(id, manager, stream, Some("Smart session required")).await? else { return Ok(()) };
     let SmartTransfer { writer, ctrl_queue, ift, alive: _ } = transfer;
 
     let pr = protocol::PullRequest::new(pc.path.clone());
@@ -394,20 +376,14 @@ async fn pull_handler(
     }
 
     // Wait for pull_meta
-    let meta = match shells::read_ctrl_queue_msg(&ctrl_queue, pc.timeout).await {
-        Some((_, p)) => match serde_json::from_slice::<serde_json::Value>(&p) {
-            Ok(v) => v,
-            Err(_) => {
-                ift.store(false, Ordering::SeqCst);
-                respond_error(stream, "Invalid download meta").await;
-                return Ok(());
-            }
-        },
-        None => {
-            ift.store(false, Ordering::SeqCst);
-            respond_error(stream, "Pull meta timeout").await;
-            return Ok(());
-        }
+    let meta = if let Some((_, p)) = shells::read_ctrl_queue_msg(&ctrl_queue, pc.timeout).await { if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&p) { v } else {
+        ift.store(false, Ordering::SeqCst);
+        respond_error(stream, "Invalid download meta").await;
+        return Ok(());
+    } } else {
+        ift.store(false, Ordering::SeqCst);
+        respond_error(stream, "Pull meta timeout").await;
+        return Ok(());
     };
 
     if meta["type"] == "push_error" {
@@ -421,7 +397,7 @@ async fn pull_handler(
         return Ok(());
     }
 
-    let size = meta["size"].as_u64().unwrap_or(0) as usize;
+    let size: usize = meta["size"].as_u64().unwrap_or(0).try_into()?;
     let expected_hash = meta["hash"].as_str().unwrap_or("").to_string();
 
     // Read FILE_DATA entries from ctrl_queue until HASH
@@ -510,7 +486,10 @@ fn spawn_buf_to_socket(
                     break;
                 }
                 let mut b = buf.lock().await;
-                if !b.is_empty() {
+                if b.is_empty() {
+                    drop(b);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                } else {
                     let data = b.clone();
                     b.clear();
                     drop(b);
@@ -518,9 +497,6 @@ fn spawn_buf_to_socket(
                         pc.store(true, Ordering::SeqCst);
                         break;
                     }
-                } else {
-                    drop(b);
-                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             }
         });
@@ -528,7 +504,7 @@ fn spawn_buf_to_socket(
 }
 
 /// Spawn a thread that reads from a Unix socket and writes to a tokio TCP writer.
-/// `framed` — if true, data is wrapped in FRAME_SHELL; otherwise raw bytes.
+/// `framed` — if true, data is wrapped in `FRAME_SHELL`; otherwise raw bytes.
 fn spawn_socket_to_writer(
     mut socket: std::os::unix::net::UnixStream,
     writer: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
@@ -568,10 +544,7 @@ fn spawn_socket_to_writer(
                     }
                     Err(ref e)
                         if e.kind() == std::io::ErrorKind::WouldBlock
-                            || e.kind() == std::io::ErrorKind::TimedOut =>
-                    {
-                        continue;
-                    }
+                            || e.kind() == std::io::ErrorKind::TimedOut => {}
                     Err(_) => {
                         pc.store(true, Ordering::SeqCst);
                         break;
@@ -706,10 +679,7 @@ async fn interact_handler(
                     }
                     Err(ref e)
                         if e.kind() == std::io::ErrorKind::WouldBlock
-                            || e.kind() == std::io::ErrorKind::TimedOut =>
-                    {
-                        continue;
-                    }
+                            || e.kind() == std::io::ErrorKind::TimedOut => {}
                     Err(_) => break 'outer,
                 }
             }
@@ -724,7 +694,7 @@ async fn interact_handler(
                     stream.flush()?;
                 }
                 Err(e) => {
-                    let m = format!("\r\n[!] {}\r\n", e);
+                    let m = format!("\r\n[!] {e}\r\n");
                     stream.write_all(m.as_bytes())?;
                     stream.flush()?;
                 }
