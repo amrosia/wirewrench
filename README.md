@@ -41,7 +41,7 @@ ww send 1 "whoami"
 ww interact 1
 ```
 
-### Smart agent (ww-target) — recommended
+### Smart agent (ww-target)
 
 `ww-target` is a Rust binary you push to the target machine. It gives you **deterministic command execution with exit codes**, file transfers, and no stale-output bugs.
 

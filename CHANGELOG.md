@@ -1,5 +1,34 @@
 # Changelog
 
+## v2.3.0 — No default timeout for smart sessions
+
+- Default `--timeout` / `-t` changed from `3.0` to `0.0` (no timeout) for `ww send`
+- Smart (ww-target) sessions: server waits indefinitely for `FRAME_CMD_RESULT` — ww-target signals command completion deterministically
+- Explicit `-t` still works as a safety cap when needed
+- Dumb TCP shells fall back to 3s default when no timeout is given
+
+## v2.2.0 — Deterministic command execution with exit codes
+
+- **`FRAME_CMD` (0x08) / `FRAME_CMD_RESULT` (0x09)** — new protocol frames for per-command execution
+- **ww-target**: each `ww send` command spawns a fresh `sh -c` process, captures stdout/stderr/exit code via `wait_with_output()`
+- **No stale output**: per-command sequence numbers correlate `FRAME_CMD` ↔ `FRAME_CMD_RESULT`; late-arriving output from previous commands is silently dropped
+- Server-side per-command oneshot channels replace shared-buffer polling for smart sessions
+- Client displays `exit code: N` when present in the response
+
+## v2.1.0 — Smart agent, file transfers, interactive mode
+
+- **`ww-target`** — lightweight Rust agent connecting back on port :4446 with a framed binary protocol:
+  - Handshake, persistent `/bin/sh` for interactive sessions
+  - Shell output relayed via `FRAME_SHELL` frames
+  - File transfer support (push/pull with SHA-256 verification)
+  - Automatic reconnection with configurable poll interval
+- **File transfers**: `ww targ upload` / `ww targ download` / `ww targ cancel`
+- **Interactive mode** (`ww interact`) now uses `rustyline` for full line editing, history, and word navigation
+- **Script mode** (`ww script`) improved — separate `send` + `read` calls with 300ms delay for reliable output capture
+- `--stdin` flag added to `ww send` for piping commands
+- `--wait` parameter removed (replaced by `-t` / `--timeout`)
+- Various clippy fixes and code simplifications
+
 ## v2.0.0 — Complete rework: from web shell tool to remote shell toolkit
 
 - Complete project rewrite as a client-server remote shell toolkit
