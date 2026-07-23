@@ -28,8 +28,8 @@ enum Commands {
         /// Read command from stdin instead of positional argument
         #[arg(short = 's', long)]
         stdin: bool,
-        /// Timeout in seconds before giving up on output (default: 3.0)
-        #[arg(short = 't', long, default_value = "3.0")]
+        /// Timeout in seconds before giving up on output (default: 0 = no timeout for ww-target; dumb shells still default to 3s)
+        #[arg(short = 't', long, default_value = "0.0")]
         timeout: f64,
         /// Command to execute (all remaining arguments, no extra quoting needed)
         #[arg(trailing_var_arg = true, num_args = 1..)]
@@ -184,6 +184,9 @@ fn cmd_send(socket_path: &str, id: u32, command: &str, timeout: f64) -> Result<(
                 println!();
             }
         }
+    }
+    if let Some(ec) = resp["exit_code"].as_i64() {
+        eprintln!("exit code: {ec}");
     }
     Ok(())
 }

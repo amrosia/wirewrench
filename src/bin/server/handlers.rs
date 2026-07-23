@@ -179,13 +179,49 @@ async fn send_handler(
             if s.in_file_transfer.load(Ordering::SeqCst) {
                 return respond_json(stream, &Response::error("Session busy with file transfer")).await;
             }
-            let to_send = format!("{command}\n");
+
+            // FRAME_CMD: per-command sh -c, stateless, bounded output with exit code.
+            let seq = s.next_cmd_seq.fetch_add(1, Ordering::SeqCst);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            {
+                let mut map = s.pending_cmds.lock().await;
+                map.insert(seq, tx);
+            }
+
+            let req = protocol::CmdRequest { seq, cmd: command };
             {
                 let mut w = s.writer.lock().await;
-                frame::write_frame(&mut *w, protocol::FRAME_SHELL, to_send.as_bytes()).await?;
+                frame::write_json_frame(&mut *w, protocol::FRAME_CMD, &req).await?;
             }
-            let resp = respond_read(&s.shell_buf, timeout).await;
-            respond_json(stream, &resp).await
+            drop(mg);
+
+            // For Smart sessions, ww-target signals command completion deterministically.
+            // timeout <= 0 means "wait as long as it takes"; otherwise cap at the given value.
+            async fn await_result(
+                rx: tokio::sync::oneshot::Receiver<protocol::CmdResult>,
+                timeout: f64,
+            ) -> std::result::Result<protocol::CmdResult, &'static str> {
+                if timeout > 0.0 {
+                    match tokio::time::timeout(std::time::Duration::from_secs_f64(timeout), rx).await {
+                        Ok(Ok(r)) => Ok(r),
+                        Ok(Err(_)) => Err("Internal error: response channel closed"),
+                        Err(_) => Err("Command timed out"),
+                    }
+                } else {
+                    rx.await.map_err(|_| "Internal error: response channel closed")
+                }
+            }
+
+            match await_result(rx, timeout).await {
+                Ok(result) => {
+                    let resp = Response::with_output_exit(result.stdout, result.exit_code);
+                    if !result.stderr.is_empty() {
+                        eprintln!("[cmd #{} stderr] {}", id, result.stderr);
+                    }
+                    respond_json(stream, &resp).await
+                }
+                Err(msg) => respond_json(stream, &Response::error(msg)).await,
+            }
         }
         Some(ManagedSession::Tcp(s, b)) => {
             let to_send = format!("{command}\n");
@@ -193,7 +229,8 @@ async fn send_handler(
                 let mut w = s.writer.lock().await;
                 w.write_all(to_send.as_bytes()).await?;
             }
-            let resp = respond_read(b, timeout).await;
+            let tcp_timeout = if timeout > 0.0 { timeout } else { 3.0 };
+            let resp = respond_read(b, tcp_timeout).await;
             respond_json(stream, &resp).await
         }
         #[cfg(feature = "web")]

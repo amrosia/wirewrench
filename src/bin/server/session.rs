@@ -1,10 +1,10 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::io::AsyncReadExt;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, oneshot};
 
 use wirewrench::target::protocol;
 use wirewrench::ShellInfo;
@@ -66,6 +66,8 @@ impl ShellSession {
 
 // ── Smart session (ww-target on port 4446) ─────────────────────────────────
 
+pub type PendingCmds = Arc<Mutex<HashMap<u64, oneshot::Sender<protocol::CmdResult>>>>;
+
 pub struct SmartSession {
     id: u32,
     addr: String,
@@ -75,6 +77,8 @@ pub struct SmartSession {
     pub ctrl_queue: CtrlQueue,
     pub alive: Arc<AtomicBool>,
     pub in_file_transfer: Arc<AtomicBool>,
+    pub next_cmd_seq: AtomicU64,
+    pub pending_cmds: PendingCmds,
     reader_handle: tokio::task::JoinHandle<()>,
 }
 
@@ -86,11 +90,13 @@ impl SmartSession {
         let shell_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let ctrl_queue: CtrlQueue = Arc::new(Mutex::new(std::collections::VecDeque::new()));
         let in_file_transfer = Arc::new(AtomicBool::new(false));
+        let pending_cmds: PendingCmds = Arc::new(Mutex::new(HashMap::new()));
 
         let shell_clone = Arc::clone(&shell_buf);
         let ctrl_clone = Arc::clone(&ctrl_queue);
         let alive_clone = Arc::clone(&alive);
         let ift_clone = Arc::clone(&in_file_transfer);
+        let pending_clone = Arc::clone(&pending_cmds);
 
         let reader_handle = tokio::spawn(async move {
             let mut r = reader;
@@ -105,6 +111,14 @@ impl SmartSession {
                         let mut q = ctrl_clone.lock().await;
                         q.push_back((ftype, payload));
                     }
+                    protocol::FRAME_CMD_RESULT => {
+                        if let Ok(result) = serde_json::from_slice::<protocol::CmdResult>(&payload) {
+                            let mut map = pending_clone.lock().await;
+                            if let Some(tx) = map.remove(&result.seq) {
+                                let _ = tx.send(result);
+                            }
+                        }
+                    }
                     protocol::FRAME_CANCEL => {
                         ift_clone.store(false, Ordering::SeqCst);
                     }
@@ -113,7 +127,7 @@ impl SmartSession {
             }
         });
 
-        Self { id, addr, created: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(), writer, shell_buf, ctrl_queue, alive, in_file_transfer, reader_handle }
+        Self { id, addr, created: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(), writer, shell_buf, ctrl_queue, alive, in_file_transfer, next_cmd_seq: AtomicU64::new(1), pending_cmds, reader_handle }
     }
 
     pub fn info(&self) -> ShellInfo {

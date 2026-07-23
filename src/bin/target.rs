@@ -22,7 +22,7 @@ use anyhow::{Context as _, Result};
 use clap::Parser;
 
 use sha2::Digest as _;
-use wirewrench::target::protocol::{FRAME_SHELL, FRAME_HANDSHAKE, Handshake, FRAME_FILE_CTRL, FRAME_CANCEL, FRAME_HASH, FRAME_KEEPALIVE, PushReady, FRAME_FILE_DATA, PushError, PushVerified, PullMeta, PushDone};
+use wirewrench::target::protocol::{FRAME_SHELL, FRAME_HANDSHAKE, Handshake, FRAME_FILE_CTRL, FRAME_CANCEL, FRAME_HASH, FRAME_KEEPALIVE, PushReady, FRAME_FILE_DATA, PushError, PushVerified, PullMeta, PushDone, FRAME_CMD, FRAME_CMD_RESULT, CmdRequest, CmdResult};
 
 #[derive(Parser)]
 #[command(name = "ww-target")]
@@ -169,6 +169,50 @@ fn run_session(stream: &TcpStream) -> Result<()> {
                 eprintln!("[!] Received cancel");
                 // For now, just continue — the current push/pull handler will
                 // fail when it can't read the expected frames
+            }
+            FRAME_CMD => {
+                let req: CmdRequest = match serde_json::from_slice(&payload) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("[-] Invalid CMD request: {e}");
+                        continue;
+                    }
+                };
+
+                // Spawn sh -c for each command — stateless, bounded output, exit code captured.
+                let child = Command::new("sh")
+                    .args(["-c", &req.cmd])
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn();
+
+                match child {
+                    Ok(c) => {
+                        let output = c.wait_with_output().unwrap_or_else(|_| {
+                            std::process::Output {
+                                status: std::process::ExitStatus::default(),
+                                stdout: Vec::new(),
+                                stderr: Vec::new(),
+                            }
+                        });
+                        let result = CmdResult {
+                            seq: req.seq,
+                            exit_code: output.status.code().unwrap_or(-1),
+                            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                        };
+                        let _ = write_json_frame(&mut writer, FRAME_CMD_RESULT, &result);
+                    }
+                    Err(e) => {
+                        let result = CmdResult {
+                            seq: req.seq,
+                            exit_code: -1,
+                            stdout: String::new(),
+                            stderr: format!("Failed to spawn sh: {e}"),
+                        };
+                        let _ = write_json_frame(&mut writer, FRAME_CMD_RESULT, &result);
+                    }
+                }
             }
             FRAME_HASH | FRAME_KEEPALIVE => {
                 // Ignore (handled inside push/pull handlers for HASH)
