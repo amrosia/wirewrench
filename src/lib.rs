@@ -7,19 +7,6 @@ pub const DEFAULT_SOCKET: &str = "/tmp/wirewrench.sock";
 pub const DEFAULT_PORT: u16 = 4444;
 pub const DEFAULT_SMART_PORT: u16 = 4446;
 
-// ── Web shell config (serialized in Command.data for register_web) ────────
-
-#[cfg(feature = "web")]
-#[derive(Debug, Clone, Deserialize)]
-pub struct WebShellConfig {
-    pub url: String,
-    pub injection_point: String,
-    pub method: String,
-    pub body_template: Option<String>,
-    pub headers: Vec<String>,
-    pub cookie: Option<String>,
-}
-
 #[derive(Deserialize)]
 pub struct Command {
     pub action: String,
@@ -39,27 +26,36 @@ pub struct Response {
     pub output: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stderr: Option<String>,
 }
 
 impl Response {
     #[must_use]
     pub fn ok() -> Self {
-        Self { status: "ok".into(), message: None, shells: None, output: None, exit_code: None }
+        Self { status: "ok".into(), message: None, shells: None, output: None, exit_code: None, stderr: None }
     }
     pub fn error(msg: impl Into<String>) -> Self {
-        Self { status: "error".into(), message: Some(msg.into()), shells: None, output: None, exit_code: None }
+        Self { status: "error".into(), message: Some(msg.into()), shells: None, output: None, exit_code: None, stderr: None }
     }
     #[must_use]
     pub fn with_shells(shells: serde_json::Value) -> Self {
-        Self { status: "ok".into(), message: None, shells: Some(shells), output: None, exit_code: None }
+        Self { status: "ok".into(), message: None, shells: Some(shells), output: None, exit_code: None, stderr: None }
     }
     #[must_use]
     pub fn with_output(out: String) -> Self {
-        Self { status: "ok".into(), message: None, shells: None, output: Some(out), exit_code: None }
+        Self { status: "ok".into(), message: None, shells: None, output: Some(out), exit_code: None, stderr: None }
     }
     #[must_use]
-    pub fn with_output_exit(out: String, code: i32) -> Self {
-        Self { status: "ok".into(), message: None, shells: None, output: Some(out), exit_code: Some(code) }
+    pub fn with_output_exit(out: String, code: i32, stderr: String) -> Self {
+        Self {
+            status: "ok".into(),
+            message: None,
+            shells: None,
+            output: Some(out),
+            exit_code: Some(code),
+            stderr: if stderr.is_empty() { None } else { Some(stderr) },
+        }
     }
 }
 

@@ -140,46 +140,11 @@ impl SmartSession {
     }
 }
 
-// ── Web shell session ─────────────────────────────────────────────────────
-
-#[cfg(feature = "web")]
-pub struct WebShellSession {
-    pub id: u32,
-    pub url: String,
-    pub injection_point: String,
-    pub method: String,
-    pub body_template: Option<String>,
-    pub headers: Vec<String>,
-    pub cookie: Option<String>,
-    created: f64,
-    pub alive: Arc<AtomicBool>,
-    pub buf: Arc<Mutex<Vec<u8>>>,
-}
-
-#[cfg(feature = "web")]
-impl WebShellSession {
-    pub fn new(id: u32, config: wirewrench::WebShellConfig) -> Self {
-        Self {
-            id, url: config.url, injection_point: config.injection_point, method: config.method,
-            body_template: config.body_template, headers: config.headers, cookie: config.cookie,
-            created: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(),
-            alive: Arc::new(AtomicBool::new(true)),
-            buf: Arc::new(Mutex::new(Vec::new())),
-        }
-    }
-
-    pub fn info(&self) -> ShellInfo {
-        ShellInfo { id: self.id, addr: format!("[web] {}", self.url), created: self.created, alive: self.alive.load(Ordering::SeqCst) }
-    }
-}
-
 // ── Managed session enum ─────────────────────────────────────────────────
 
 pub enum ManagedSession {
     Tcp(ShellSession, Arc<Mutex<Vec<u8>>>),
     Smart(SmartSession),
-    #[cfg(feature = "web")]
-    Web(WebShellSession),
 }
 
 impl ManagedSession {
@@ -187,8 +152,6 @@ impl ManagedSession {
         match self {
             ManagedSession::Tcp(s, _) => s.info(),
             ManagedSession::Smart(s) => s.info(),
-            #[cfg(feature = "web")]
-            ManagedSession::Web(s) => s.info(),
         }
     }
 
@@ -196,8 +159,6 @@ impl ManagedSession {
         match self {
             ManagedSession::Tcp(s, _) => s.alive.load(Ordering::SeqCst),
             ManagedSession::Smart(s) => s.alive.load(Ordering::SeqCst),
-            #[cfg(feature = "web")]
-            ManagedSession::Web(s) => s.alive.load(Ordering::SeqCst),
         }
     }
 
@@ -205,8 +166,6 @@ impl ManagedSession {
         match self {
             ManagedSession::Tcp(s, _) => s.close(),
             ManagedSession::Smart(s) => s.close(),
-            #[cfg(feature = "web")]
-            ManagedSession::Web(_) => {}
         }
     }
 }
@@ -233,12 +192,6 @@ impl SessionManager {
         let id = self.next_id; self.next_id += 1;
         let session = SmartSession::new(id, addr, stream);
         self.sessions.insert(id, ManagedSession::Smart(session)); id
-    }
-
-    #[cfg(feature = "web")]
-    pub fn add_web(&mut self, config: wirewrench::WebShellConfig) -> u32 {
-        let id = self.next_id; self.next_id += 1;
-        self.sessions.insert(id, ManagedSession::Web(WebShellSession::new(id, config))); id
     }
 
     pub fn remove(&mut self, id: u32) {

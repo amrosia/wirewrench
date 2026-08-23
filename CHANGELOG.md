@@ -1,5 +1,12 @@
 # Changelog
 
+## v3.0.0 — Drop web shell support; pure Rust dependency tree
+
+- `ww send` now returns stderr from smart (ww-target) sessions to the client and prints it there, instead of logging it in `ww-server`
+- `ww send` no longer prints the misleading `--timeout` warning for smart sessions when a command produces no output (ww-target reports the exit code deterministically)
+- Documented that dumb shells must merge stderr into the socket (e.g. `ncat ... --sh-exec "/bin/bash 2>&1"`) for `ww send` to capture error output
+- **Removed the `web` feature** and all web-shell support (`ww web`, `register_web`, web-shell sessions). The dependency tree is now 100% pure Rust — no `reqwest`/`rustls`/`ring`/C compiler — so musl targets build self-contained via `rust-lld`.
+
 ## v2.3.0 — No default timeout for smart sessions
 
 - Default `--timeout` / `-t` changed from `3.0` to `0.0` (no timeout) for `ww send`

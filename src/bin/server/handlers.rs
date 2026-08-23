@@ -140,18 +140,6 @@ pub async fn handle_control(
             mg.remove(cmd.id.unwrap_or(0));
             respond_json(&mut stream, &Response::ok()).await?;
         }
-        #[cfg(feature = "web")]
-        "register_web" => {
-            let config: wirewrench::WebShellConfig = match serde_json::from_str(&cmd.data.unwrap_or_default()) {
-                Ok(c) => c,
-                Err(e) => {
-                    respond_json(&mut stream, &Response::error(format!("Invalid config: {e}"))).await?;
-                    return Ok(());
-                }
-            };
-            let id = { let mut mg = manager.lock().await; mg.add_web(config) };
-            respond_json(&mut stream, &Response::with_shells(json!({"id": id}))).await?;
-        }
         "interact" => interact_handler(cmd, &manager, &mut stream).await?,
         _ => respond_json(&mut stream, &Response::error(format!("Unknown action: {action}"))).await?,
     }
@@ -214,10 +202,7 @@ async fn send_handler(
 
             match await_result(rx, timeout).await {
                 Ok(result) => {
-                    let resp = Response::with_output_exit(result.stdout, result.exit_code);
-                    if !result.stderr.is_empty() {
-                        eprintln!("[cmd #{} stderr] {}", id, result.stderr);
-                    }
+                    let resp = Response::with_output_exit(result.stdout, result.exit_code, result.stderr);
                     respond_json(stream, &resp).await
                 }
                 Err(msg) => respond_json(stream, &Response::error(msg)).await,
@@ -232,22 +217,6 @@ async fn send_handler(
             let tcp_timeout = if timeout > 0.0 { timeout } else { 3.0 };
             let resp = respond_read(b, tcp_timeout).await;
             respond_json(stream, &resp).await
-        }
-        #[cfg(feature = "web")]
-        Some(ManagedSession::Web(s)) => {
-            let config = wirewrench::WebShellConfig {
-                url: s.url.clone(),
-                injection_point: s.injection_point.clone(),
-                method: s.method.clone(),
-                body_template: s.body_template.clone(),
-                headers: s.headers.clone(),
-                cookie: s.cookie.clone(),
-            };
-            drop(mg);
-            match shells::web_shell_exec(&config, &command).await {
-                Ok(body) => respond_json(stream, &Response::with_output(body)).await,
-                Err(e) => respond_json(stream, &Response::error(e.to_string())).await,
-            }
         }
         None => respond_json(stream, &Response::error("Shell not found")).await,
     }
@@ -267,8 +236,6 @@ async fn read_handler(
     let buf = match mg.sessions.get(&id) {
         Some(ManagedSession::Smart(s)) => Some(Arc::clone(&s.shell_buf)),
         Some(ManagedSession::Tcp(_, b)) => Some(Arc::clone(b)),
-        #[cfg(feature = "web")]
-        Some(ManagedSession::Web(s)) => Some(Arc::clone(&s.buf)),
         None => None,
     };
     drop(mg);
@@ -671,72 +638,6 @@ async fn interact_handler(
         respond_json(stream, &serde_json::json!({"status":"ok","message":"Entering interactive mode"})).await?;
         stream.write_all(b"\r\n[+] Interactive mode. Press Ctrl+C to detach\r\n")?;
         run_interact_bridge(sb, sw, stream, alive, false).await;
-        return Ok(());
-    }
-
-    // Web
-    #[cfg(feature = "web")]
-    if let Some((config, _buf)) = {
-        let mg = manager.lock().await;
-        match mg.sessions.get(&id) {
-            Some(ManagedSession::Web(s)) => Some((
-                wirewrench::WebShellConfig {
-                    url: s.url.clone(),
-                    injection_point: s.injection_point.clone(),
-                    method: s.method.clone(),
-                    body_template: s.body_template.clone(),
-                    headers: s.headers.clone(),
-                    cookie: s.cookie.clone(),
-                },
-                Arc::clone(&s.buf),
-            )),
-            _ => None,
-        }
-    } {
-        let _ = manager;
-        stream.write_all(b"\r\n[+] Web shell interactive mode (Ctrl+C to detach)\r\n>> ")?;
-        stream.flush()?;
-        stream.set_read_timeout(Some(Duration::from_millis(100)))?;
-        'outer: loop {
-            let mut cb = Vec::new();
-            let mut tmp = [0u8; 65536];
-            'rl: loop {
-                match stream.read(&mut tmp) {
-                    Ok(0) => break 'outer,
-                    Ok(n) => {
-                        for &b in &tmp[..n] {
-                            if b == 0x03 {
-                                break 'outer;
-                            }
-                            if b == b'\n' {
-                                break 'rl;
-                            }
-                            cb.push(b);
-                        }
-                    }
-                    Err(ref e)
-                        if e.kind() == std::io::ErrorKind::WouldBlock
-                            || e.kind() == std::io::ErrorKind::TimedOut => {}
-                    Err(_) => break 'outer,
-                }
-            }
-            let cmd = String::from_utf8_lossy(&cb).trim().to_string();
-            if cmd.is_empty() {
-                continue;
-            }
-            match shells::web_shell_exec(&config, &cmd).await {
-                Ok(body) => {
-                    stream.write_all(body.replace('\n', "\r\n").as_bytes())?;
-                    stream.write_all(b"\r\n>> ")?;
-                    stream.flush()?;
-                }
-                Err(e) => {
-                    let m = format!("\r\n[!] {e}\r\n");
-                    stream.write_all(m.as_bytes())?;
-                    stream.flush()?;
-                }
-            }
-        }
         return Ok(());
     }
 

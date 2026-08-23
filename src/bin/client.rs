@@ -50,27 +50,6 @@ enum Commands {
     /// Pipes, redirects, variables, and other shell syntax are passed
     /// verbatim to the remote shell and are NOT interpreted locally.
     Script { id: u32, file: String },
-    /// Register a web shell with the server (curl-like flags)
-    #[cfg(feature = "web")]
-    Web {
-        /// Target URL containing injection point marker
-        url: String,
-        /// Injection point marker [default: BLUB]
-        #[arg(short = 'i', long, default_value = "BLUB")]
-        injection_point: String,
-        /// HTTP method, curl-style: -X POST
-        #[arg(short = 'X', long = "request", default_value = "GET")]
-        method: String,
-        /// Request body / POST data, curl-style: -d "cmd=BLUB"
-        #[arg(short = 'd', long = "data")]
-        data: Option<String>,
-        /// Additional HTTP headers, curl-style: -H "Name: Value" (repeatable)
-        #[arg(short = 'H', long = "header")]
-        headers: Vec<String>,
-        /// Cookie string, curl-style: -b "name=value"
-        #[arg(short = 'b', long = "cookie")]
-        cookie: Option<String>,
-    },
     /// Target (ww-target) operations: push, pull, cancel
     Targ {
         #[command(subcommand)]
@@ -175,14 +154,27 @@ fn cmd_send(socket_path: &str, id: u32, command: &str, timeout: f64) -> Result<(
         eprintln!("Error: {msg}");
         return Ok(());
     }
+    // Smart sessions (ww-target) always include an `exit_code`, meaning the
+    // command ran to completion on the target.  Dumb shells only report
+    // output read within the polling window, so the timeout warning only
+    // applies to those.
+    let has_exit_code = resp["exit_code"].is_i64();
     if let Some(out) = resp["output"].as_str() {
         if out.is_empty() {
-            eprintln!("Warning: no output received. Try increasing --timeout (-t) if you expected output.");
+            if !has_exit_code {
+                eprintln!("Warning: no output received. Try increasing --timeout (-t) if you expected output.");
+            }
         } else {
             print!("{out}");
             if !out.ends_with('\n') {
                 println!();
             }
+        }
+    }
+    if let Some(err) = resp["stderr"].as_str().filter(|e| !e.is_empty()) {
+        eprint!("{err}");
+        if !err.ends_with('\n') {
+            eprintln!();
         }
     }
     if let Some(ec) = resp["exit_code"].as_i64() {
@@ -237,63 +229,6 @@ fn cmd_script(socket_path: &str, id: u32, file: &str) -> Result<()> {
                     print!("{out}");
                 }
     }
-    Ok(())
-}
-
-
-
-// ── Web shell registration ────────────────────────────────────────────────
-
-#[cfg(feature = "web")]
-fn cmd_web(
-    socket_path: &str,
-    url: &str,
-    injection_point: &str,
-    method: &str,
-    data: Option<&str>,
-    headers: &[String],
-    cookie: Option<&str>,
-) -> Result<()> {
-    // Validate injection point is present exactly once
-    let target = data.unwrap_or(url);
-    let count = target.matches(injection_point).count();
-    match count {
-        0 => {
-            eprintln!("Error: No injection point '{injection_point}' found in '{target}'");
-            eprintln!("       Add '{injection_point}' to your URL or -d data string");
-            return Ok(());
-        }
-        1 => {} // ok
-        _ => {
-            eprintln!("Error: Too many '{injection_point}' injection points in '{target}'");
-            return Ok(());
-        }
-    }
-
-    // Build config and send to server
-    let config = serde_json::json!({
-        "url": url,
-        "injection_point": injection_point,
-        "method": method,
-        "body_template": data,
-        "headers": headers,
-        "cookie": cookie,
-    });
-
-    let resp = send_cmd(socket_path, &serde_json::json!({
-        "action": "register_web",
-        "data": config.to_string(),
-    }))?;
-
-    if resp["status"] == "ok" {
-        let id = resp["shells"]["id"].as_u64().unwrap_or(0);
-        println!("[+] Web shell registered as session #{id}");
-        println!("[+] Use 'ww send {id} \"command\"' or 'ww interact {id}'");
-    } else {
-        let msg = resp["message"].as_str().unwrap_or("Unknown error");
-        eprintln!("Error: {msg}");
-    }
-
     Ok(())
 }
 
@@ -514,10 +449,6 @@ fn main() -> Result<()> {
         Commands::Interact { id } => cmd_interact(&cli.socket, *id),
         Commands::Close { id } => cmd_close(&cli.socket, *id),
         Commands::Script { id, file } => cmd_script(&cli.socket, *id, file),
-        #[cfg(feature = "web")]
-        Commands::Web { url, injection_point, method, data, headers, cookie } => {
-            cmd_web(&cli.socket, url, injection_point, method, data.as_deref(), headers, cookie.as_deref())
-        }
         Commands::Targ { action } => match action {
             TargAction::Upload { id, local, remote, timeout } => {
                 cmd_targ_upload(&cli.socket, *id, local, remote.as_deref(), *timeout)
