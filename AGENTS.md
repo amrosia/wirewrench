@@ -6,9 +6,9 @@ When a feature or change is finished — **before pushing** — bump the version
 tag it, then push. Pushing a `v*` tag triggers `.github/workflows/release.yml`,
 which builds all release binaries and publishes the GitHub Release.
 
-1. **Bump semver** in `Cargo.toml` and `Cargo.lock` (only the `wirewrench`
-   package entry — leave dependency versions alone) and add a matching
-   `## vX.Y.Z` entry at the top of `CHANGELOG.md`:
+1. **Bump semver** in `Cargo.toml` (the `version` field — `Cargo.lock` updates
+   automatically when you run `cargo check`, never edit it by hand) and add a
+   matching `## vX.Y.Z` entry at the top of `CHANGELOG.md`:
    - `major` — breaking changes (protocol changes, removed flags, incompatible behavior)
    - `minor` — new features (the usual case)
    - `patch` — bug fixes
@@ -20,7 +20,8 @@ which builds all release binaries and publishes the GitHub Release.
 ### Exact commands
 
 ```bash
-# 1. edit Cargo.toml + Cargo.lock + CHANGELOG.md (bump to X.Y.Z), then:
+# 1. edit Cargo.toml (version field) + CHANGELOG.md (bump to X.Y.Z);
+#    Cargo.lock updates itself when you run:
 cargo check
 
 # 2. commit
