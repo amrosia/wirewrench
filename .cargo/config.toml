@@ -1,3 +1,8 @@
 [target.x86_64-unknown-linux-gnu]
 linker = "gcc"
 rustflags = ["-C", "link-self-contained=no"]
+
+# Cross-compiling ww-target for Windows from a Linux host requires mingw-w64
+# (gcc-mingw-w64-x86-64 on Debian/Ubuntu, mingw-w64 via nix).
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"

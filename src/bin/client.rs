@@ -1,3 +1,6 @@
+#[cfg(not(unix))]
+compile_error!("ww is only intended to be built for unix platforms");
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::time::Duration;
@@ -119,8 +122,8 @@ fn cmd_list(socket_path: &str) -> Result<()> {
         if arr.is_empty() {
             println!("No active shells.");
         } else {
-            println!("{:<5} {:<25} {:<7} Age", "ID", "Address", "Alive");
-            println!("{}", "-".repeat(50));
+            println!("{:<5} {:<25} {:<7} {:<16} Age", "ID", "Address", "Alive", "Platform");
+            println!("{}", "-".repeat(60));
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -130,9 +133,10 @@ fn cmd_list(socket_path: &str) -> Result<()> {
                 let addr = s["addr"].as_str().unwrap_or("?");
                 let alive = s["alive"].as_bool().unwrap_or(false);
                 let created = s["created"].as_f64().unwrap_or(0.0);
+                let platform = s["platform"].as_str().unwrap_or("-");
                 let age = (now - created) as u64;
                 let alive_str = if alive { "✓" } else { "✗" };
-                println!("{id:<5} {addr:<25} {alive_str:<7} {age}s");
+                println!("{id:<5} {addr:<25} {alive_str:<7} {platform:<16} {age}s");
             }
         }
     } else {

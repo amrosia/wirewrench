@@ -1,5 +1,23 @@
 # Changelog
 
+## v3.1.0 — Cross-platform `ww-target`
+
+- **`ww-target` is now cross-platform**: builds and runs on Linux, macOS, and Windows
+  - Platform shell abstraction — interactive shell and per-command execution use
+    `/bin/sh` on Unix and `%COMSPEC%` (`cmd.exe /C`) on Windows
+  - `--shell` CLI flag overrides the default shell on any platform
+  - Windows: LF→CRLF translation on shell stdin; CRLF→LF normalization of command output
+  - Hostname detection falls back to the `hostname` command when `HOSTNAME`/`COMPUTERNAME` are unset
+- **`ww` and `ww-server` are now gated to Unix** — non-Unix builds fail at compile
+  time with `ww is only intended to be built for unix platforms`
+- **`ww list` shows a Platform column** — smart sessions report their OS/arch from
+  the handshake (e.g. `windows/x86_64`, `macos/aarch64`, `linux/x86_64`)
+- CI: whole-suite gate checks (Unix pass, Windows fails with the intended message),
+  Linux musl release, `ww-target.exe` (windows-gnu via mingw), macOS per-arch
+  `ww-target`, and the Linux e2e suite
+- Fixed `tests/e2e_target.sh` to match the current CLI (`ww send 1 …`, `ww targ upload`,
+  capture stderr for exit codes)
+
 ## v3.0.0 — Drop web shell support; pure Rust dependency tree
 
 - `ww send` now returns stderr from smart (ww-target) sessions to the client and prints it there, instead of logging it in `ww-server`

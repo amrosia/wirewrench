@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Whole-suite gate checks ────────────────────────────────────────────────
+  # ww / ww-server are Unix-only by design. Unix builds must pass; Windows
+  # whole-suite builds must fail with the intentional compile_error message.
+  gate-check-unix:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check
+
+  gate-check-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Whole-suite build must be rejected on Windows
+        shell: bash
+        run: |
+          if cargo check 2> build.log; then
+            echo "ERROR: whole-suite Windows build unexpectedly succeeded" >&2
+            exit 1
+          fi
+          grep -q "only intended to be built for unix platforms" build.log \
+            || { echo "ERROR: expected 'only intended to be built for unix platforms' in build output" >&2; cat build.log; exit 1; }
+          echo "Windows whole-suite build correctly rejected:"
+          grep "only intended to be built for unix platforms" build.log
+
+  # ── Linux release (all three binaries) ────────────────────────────────────
+  build-linux:
+    runs-on: ubuntu-latest
+    needs: gate-check-unix
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - run: cargo build --release --target x86_64-unknown-linux-musl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wirewrench-linux-musl
+          path: |
+            target/x86_64-unknown-linux-musl/release/ww
+            target/x86_64-unknown-linux-musl/release/ww-server
+            target/x86_64-unknown-linux-musl/release/ww-target
+
+  # ── ww-target for Windows (cross-compiled on Linux via mingw) ─────────────
+  build-windows-target:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - name: Install mingw-w64
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64
+      - run: cargo build --release --target x86_64-pc-windows-gnu --bin ww-target
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ww-target-windows
+          path: target/x86_64-pc-windows-gnu/release/ww-target.exe
+
+  # ── ww-target for macOS (native, per-arch) ────────────────────────────────
+  build-macos-target:
+    strategy:
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }} --bin ww-target
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ww-target-macos-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/ww-target
+
+  # ── End-to-end test (Linux server + Linux target) ─────────────────────────
+  e2e-linux:
+    runs-on: ubuntu-latest
+    needs: build-linux
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - run: |
+          export PATH="$PWD/target/release:$PATH"
+          bash tests/e2e_target.sh

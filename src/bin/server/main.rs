@@ -1,3 +1,6 @@
+#[cfg(not(unix))]
+compile_error!("ww-server is only intended to be built for unix platforms");
+
 mod frame;
 mod session;
 mod shells;

@@ -55,7 +55,7 @@ impl ShellSession {
     }
 
     pub fn info(&self) -> ShellInfo {
-        ShellInfo { id: self.id, addr: self.addr.clone(), created: self.created, alive: self.alive.load(Ordering::SeqCst) }
+        ShellInfo { id: self.id, addr: self.addr.clone(), created: self.created, alive: self.alive.load(Ordering::SeqCst), platform: None }
     }
 
     pub fn close(&mut self) {
@@ -72,6 +72,7 @@ pub struct SmartSession {
     id: u32,
     addr: String,
     created: f64,
+    platform: Option<String>,
     pub writer: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
     pub shell_buf: Arc<Mutex<Vec<u8>>>,
     pub ctrl_queue: CtrlQueue,
@@ -83,7 +84,7 @@ pub struct SmartSession {
 }
 
 impl SmartSession {
-    pub fn new(id: u32, addr: String, stream: tokio::net::TcpStream) -> Self {
+    pub fn new(id: u32, addr: String, platform: Option<String>, stream: tokio::net::TcpStream) -> Self {
         let (reader, writer) = stream.into_split();
         let writer = Arc::new(Mutex::new(writer));
         let alive = Arc::new(AtomicBool::new(true));
@@ -127,11 +128,11 @@ impl SmartSession {
             }
         });
 
-        Self { id, addr, created: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(), writer, shell_buf, ctrl_queue, alive, in_file_transfer, next_cmd_seq: AtomicU64::new(1), pending_cmds, reader_handle }
+        Self { id, addr, created: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(), platform, writer, shell_buf, ctrl_queue, alive, in_file_transfer, next_cmd_seq: AtomicU64::new(1), pending_cmds, reader_handle }
     }
 
     pub fn info(&self) -> ShellInfo {
-        ShellInfo { id: self.id, addr: format!("[ww-target] {}", self.addr), created: self.created, alive: self.alive.load(Ordering::SeqCst) }
+        ShellInfo { id: self.id, addr: format!("[ww-target] {}", self.addr), created: self.created, alive: self.alive.load(Ordering::SeqCst), platform: self.platform.clone() }
     }
 
     pub fn close(&mut self) {
@@ -188,9 +189,9 @@ impl SessionManager {
         self.sessions.insert(id, ManagedSession::Tcp(session, buf)); id
     }
 
-    pub fn add_smart(&mut self, addr: String, stream: tokio::net::TcpStream) -> u32 {
+    pub fn add_smart(&mut self, addr: String, platform: Option<String>, stream: tokio::net::TcpStream) -> u32 {
         let id = self.next_id; self.next_id += 1;
-        let session = SmartSession::new(id, addr, stream);
+        let session = SmartSession::new(id, addr, platform, stream);
         self.sessions.insert(id, ManagedSession::Smart(session)); id
     }
 

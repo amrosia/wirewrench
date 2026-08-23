@@ -1,8 +1,8 @@
-# WireWrench v2
+# WireWrench
 
 > **A remote shell toolkit** — catch reverse shells, manage sessions, deploy smart agents, transfer files.
 
-WireWrench v2 is a complete rework of the original single-binary REPL into a full client-server remote shell toolkit with a smart agent (`ww-target`) for reliable command execution and file transfer.
+WireWrench is a complete rework of the original single-binary REPL into a full client-server remote shell toolkit with a smart agent (`ww-target`) for reliable command execution and file transfer.
 
 ## Architecture
 
@@ -18,6 +18,20 @@ WireWrench v2 is a complete rework of the original single-binary REPL into a ful
 │  • targ pull    │                    │  • Unix socket   │                  └─────────────┘
 └─────────────────┘                    └──────────────────┘
 ```
+
+## Platform support
+
+| Binary | Builds & runs on |
+|--------|------------------|
+| `ww` (client) | Unix (Linux, macOS; BSDs best-effort) |
+| `ww-server` | Unix (Linux, macOS; BSDs best-effort) |
+| `ww-target` | Unix (Linux, macOS) **and** Windows |
+
+`ww` and `ww-server` are intentionally Unix-only — building them for Windows
+fails at compile time with `ww is only intended to be built for unix platforms`.
+`ww-target` is the cross-platform agent: deploy the Linux/macOS binary or the
+`ww-target.exe` build to any target; a Linux/macOS `ww-server` manages them all
+identically over the OS-agnostic framed protocol.
 
 ## Quick Start
 
@@ -107,7 +121,7 @@ ww-server -s /tmp/ww.sock          # custom socket path
 ### Client — Shell Commands
 
 ```bash
-# List active shells
+# List active shells (ww-target sessions show their platform, e.g. windows/x86_64)
 ww list
 
 # Send a command (smart agent: waits until command finishes; dumb shell: polls with timeout)
@@ -150,13 +164,43 @@ ww targ cancel 1
 
 | Feature | Dumb shell (ncat/bash) | ww-target |
 |---------|------------------------|-----------|
-| **Command boundaries** | None — output bleeds between commands | Deterministic — each command is `sh -c`, captured via `wait_with_output()` |
+| **Command boundaries** | None — output bleeds between commands | Deterministic — each command is `sh -c` (or `cmd /C` on Windows), captured via `wait_with_output()` |
 | **Exit codes** | Not available | Captured and returned |
 | **Stale output** | Common — old output pollutes next command | Impossible — per-command sequence numbers |
 | **File transfer** | Manual (base64 tricks) | Built-in push/pull with SHA-256 verification |
 | **Timeout default** | 3s polling cap | No default — waits as long as the command needs |
 | **State between commands** | Persistent shell | Stateless (each `ww send` is a fresh `sh -c`) |
 | **Interactive mode** | Persistent shell | Persistent shell (separate code path via FRAME_SHELL) |
+
+### Cross-platform target
+
+`ww-target` runs on Linux, macOS, and Windows. Server-side behavior is identical
+regardless of target OS, and `ww list` shows each session's platform (e.g.
+`windows/x86_64`).
+
+**Windows targets** — build `ww-target.exe` (see CI, or cross-compile with the
+`x86_64-pc-windows-gnu` target + mingw-w64) and run it on the target:
+
+```powershell
+C:\> ww-target.exe 10.0.0.5
+```
+
+Commands execute via `cmd.exe /C` (resolved from `%COMSPEC%`), so use Windows
+shell syntax: `dir` not `ls`, `type` not `cat`. Command output is decoded as
+UTF-8; non-ASCII console output is best-effort. Override the shell with
+`--shell powershell` (or `--shell C:\Path\To\Shell.exe`); on Unix the default
+is `/bin/sh`.
+
+**macOS targets** — use the `aarch64-apple-darwin` (Apple Silicon) or
+`x86_64-apple-darwin` (Intel) build. The default shell is `/bin/sh`.
+
+```bash
+target$ ./ww-target 10.0.0.5
+```
+
+macOS may quarantine downloaded binaries — clear it with
+`xattr -d com.apple.quarantine ww-target`, and approve the firewall prompt the
+first time `ww-server` binds a listening port.
 
 ### Protocol
 

@@ -67,4 +67,7 @@ pub struct ShellInfo {
     pub addr: String,
     pub created: f64,
     pub alive: bool,
+    /// Target platform reported during the smart handshake (e.g. "windows/x86_64").
+    /// `None` for dumb TCP shells, which don't perform a handshake.
+    pub platform: Option<String>,
 }

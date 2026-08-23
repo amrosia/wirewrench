@@ -73,7 +73,7 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 header "2. Simple command with output"
 
-OUT=$(ww send -w 1 "echo hello-test-42" 2>/dev/null)
+OUT=$(ww send 1 "echo hello-test-42" 2>&1)
 if echo "$OUT" | grep -q "hello-test-42"; then
     pass "Command output matches"
 else
@@ -91,7 +91,7 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 header "3. Non-zero exit code"
 
-OUT=$(ww send -w 1 "exit 77" 2>/dev/null)
+OUT=$(ww send 1 "exit 77" 2>&1)
 if echo "$OUT" | grep -q "exit code: 77"; then
     pass "Exit code 77 reported"
 else
@@ -103,7 +103,7 @@ fi
 header "4. File push with hash verification"
 
 echo "test-payload-data" > /tmp/ww_test_src.txt
-OUT=$(ww targ push 1 /tmp/ww_test_src.txt /tmp/ww_test_dst.txt 2>/dev/null)
+OUT=$(ww targ upload 1 /tmp/ww_test_src.txt /tmp/ww_test_dst.txt 2>/dev/null)
 if echo "$OUT" | grep -q "hash verified"; then
     pass "Push reported hash verified"
 else
@@ -112,7 +112,7 @@ else
 fi
 
 # Verify content on target
-OUT=$(ww send -w 1 "cat /tmp/ww_test_dst.txt" 2>/dev/null)
+OUT=$(ww send 1 "cat /tmp/ww_test_dst.txt" 2>&1)
 if echo "$OUT" | grep -q "test-payload-data"; then
     pass "Pushed file content matches on target"
 else
@@ -126,7 +126,7 @@ header "5. Binary file push (4 KB random)"
 dd if=/dev/urandom bs=1024 count=4 of=/tmp/ww_test_bin.bin 2>/dev/null
 LOCAL_HASH=$(sha256sum /tmp/ww_test_bin.bin | awk '{print $1}')
 
-OUT=$(ww targ push 1 /tmp/ww_test_bin.bin /tmp/ww_test_bin_dst.bin 2>/dev/null)
+OUT=$(ww targ upload 1 /tmp/ww_test_bin.bin /tmp/ww_test_bin_dst.bin 2>/dev/null)
 if echo "$OUT" | grep -q "$LOCAL_HASH"; then
     pass "Binary push — SHA-256 hash matches server report"
 else
@@ -136,7 +136,7 @@ else
 fi
 
 # Verify hash on target side
-OUT=$(ww send -w 1 "sha256sum /tmp/ww_test_bin_dst.bin" 2>/dev/null)
+OUT=$(ww send 1 "sha256sum /tmp/ww_test_bin_dst.bin" 2>&1)
 if echo "$OUT" | grep -q "$LOCAL_HASH"; then
     pass "Binary push — target-side SHA-256 matches local"
 else
@@ -148,7 +148,7 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 header "6. Multi-line command via --stdin"
 
-OUT=$(printf "echo first-line\necho second-line" | ww send --stdin -w 1 2>/dev/null)
+OUT=$(printf "echo first-line\necho second-line" | ww send --stdin 1 2>&1)
 if echo "$OUT" | grep -q "first-line"; then
     pass "Multi-line — first line output"
 else
@@ -163,9 +163,9 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 header "7. Serial commands preserve session"
 
-OUT1=$(ww send -w 1 "echo cmd-a" 2>/dev/null)
-OUT2=$(ww send -w 1 "echo cmd-b" 2>/dev/null)
-OUT3=$(ww send -w 1 "echo cmd-c" 2>/dev/null)
+OUT1=$(ww send 1 "echo cmd-a" 2>&1)
+OUT2=$(ww send 1 "echo cmd-b" 2>&1)
+OUT3=$(ww send 1 "echo cmd-c" 2>&1)
 if echo "$OUT1" | grep -q "cmd-a" && echo "$OUT2" | grep -q "cmd-b" && echo "$OUT3" | grep -q "cmd-c"; then
     pass "Three serial commands all succeeded"
 else
