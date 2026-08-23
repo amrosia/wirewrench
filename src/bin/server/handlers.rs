@@ -1,20 +1,83 @@
 use std::io::{BufRead, BufReader, Read, Write};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use serde_json::json;
+use rand::Rng;
+use serde_json::{json, Value};
 use sha2::Digest;
+use ssh_key::public::PublicKey;
+use ssh_key::HashAlg;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
+use wirewrench::auth as wauth;
 use wirewrench::target::protocol;
 use wirewrench::{Command, Response};
 
+use super::auth as srv_auth;
 use super::frame;
 use super::session::{CtrlQueue, ManagedSession, SessionManager};
 use super::shells;
+
+// ── Control connection (Unix socket or TCP) ────────────────────────────────
+
+/// A control connection from a `ww` client.  Normally the Unix socket at
+/// `DEFAULT_SOCKET`; when `ww-server --control-port` is used, clients may also
+/// connect over TCP (see `ww --host` / `ww --port`).
+pub enum ControlStream {
+    Unix(std::os::unix::net::UnixStream),
+    Tcp(std::net::TcpStream),
+}
+
+impl Read for ControlStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            ControlStream::Unix(s) => s.read(buf),
+            ControlStream::Tcp(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for ControlStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            ControlStream::Unix(s) => s.write(buf),
+            ControlStream::Tcp(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            ControlStream::Unix(s) => s.flush(),
+            ControlStream::Tcp(s) => s.flush(),
+        }
+    }
+}
+
+impl ControlStream {
+    pub fn try_clone(&self) -> std::io::Result<ControlStream> {
+        match self {
+            ControlStream::Unix(s) => s.try_clone().map(ControlStream::Unix),
+            ControlStream::Tcp(s) => s.try_clone().map(ControlStream::Tcp),
+        }
+    }
+
+    pub fn set_read_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            ControlStream::Unix(s) => s.set_read_timeout(dur),
+            ControlStream::Tcp(s) => s.set_read_timeout(dur),
+        }
+    }
+
+    pub fn set_nonblocking(&self, nb: bool) -> std::io::Result<()> {
+        match self {
+            ControlStream::Unix(s) => s.set_nonblocking(nb),
+            ControlStream::Tcp(s) => s.set_nonblocking(nb),
+        }
+    }
+}
 
 // ── Shared types for file-transfer commands ────────────────────────────────
 
@@ -42,7 +105,7 @@ struct SmartTransfer {
 async fn prepare_smart_transfer(
     id: u32,
     manager: &Arc<Mutex<SessionManager>>,
-    stream: &mut std::os::unix::net::UnixStream,
+    stream: &mut ControlStream,
     tcp_msg: Option<&str>,
 ) -> Result<Option<SmartTransfer>> {
     let mut t: Option<SmartTransfer> = None;
@@ -90,36 +153,194 @@ async fn prepare_smart_transfer(
 
 // ── JSON helpers ───────────────────────────────────────────────────────────
 
-/// Write a serializable value as JSON + newline to a Unix socket.
-async fn respond_json(stream: &mut std::os::unix::net::UnixStream, val: &impl serde::Serialize) -> Result<()> {
+/// Write a serializable value as JSON + newline to a control stream.
+async fn respond_json(stream: &mut ControlStream, val: &impl serde::Serialize) -> Result<()> {
     let j = serde_json::to_string(val)? + "\n";
     stream.write_all(j.as_bytes())?;
     Ok(())
 }
 
 /// Write a success response — `{status:"ok", output: msg}`.
-async fn respond_ok(stream: &mut std::os::unix::net::UnixStream, msg: impl Into<String>) {
+async fn respond_ok(stream: &mut ControlStream, msg: impl Into<String>) {
     let _ = respond_json(stream, &Response::with_output(msg.into())).await;
 }
 
 /// Write an error response — `{status:"error", message: msg}`.
-async fn respond_error(stream: &mut std::os::unix::net::UnixStream, msg: impl Into<String>) {
+async fn respond_error(stream: &mut ControlStream, msg: impl Into<String>) {
     let _ = respond_json(stream, &Response::error(msg.into())).await;
+}
+
+// ── Authentication (TCP control port only) ────────────────────────────────
+
+/// Write a JSON value as a line to a control stream (blocking).
+fn write_json_line(stream: &mut ControlStream, val: &impl serde::Serialize) -> Result<()> {
+    let j = serde_json::to_string(val)? + "\n";
+    stream.write_all(j.as_bytes())?;
+    stream.flush()?;
+    Ok(())
+}
+
+/// Run the SSH-style auth handshake on a TCP control connection.  Returns
+/// `true` if the client authenticated, `false` if the connection should be
+/// closed (a failure response has already been sent).
+fn authenticate(
+    reader: &mut BufReader<&mut ControlStream>,
+    writer: &mut ControlStream,
+    keys_path: &Path,
+) -> Result<bool> {
+    // Per-connection key load (fail closed): rotation applies immediately.
+    let keys = match srv_auth::load_authorized_keys(keys_path) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("[!] Control-port auth keys unavailable, rejecting connection: {e}");
+            let _ = write_json_line(writer, &json!({"status":"error","message":"authentication unavailable"}));
+            return Ok(false);
+        }
+    };
+
+    // Relax the read timeout for the auth phase.
+    reader.get_mut().set_read_timeout(Some(Duration::from_secs(15)))?;
+
+    let mut challenge = [0u8; wauth::CHALLENGE_LEN];
+    rand::rng().fill_bytes(&mut challenge);
+    let challenge_b64 = wauth::b64_encode(&challenge);
+
+    let mut line = String::new();
+
+    for _ in 0..wauth::MAX_OFFERS {
+        line.clear();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            return Ok(false);
+        }
+        let msg: Value = match serde_json::from_str(line.trim()) {
+            Ok(v) => v,
+            Err(_) => {
+                let _ = write_json_line(writer, &json!({"status":"error","message":"authentication required"}));
+                return Ok(false);
+            }
+        };
+
+        match msg["type"].as_str() {
+            Some("auth_offer") => {
+                let Some(key_str) = msg["key"].as_str() else {
+                    let _ = write_json_line(writer, &json!({"type":"auth_reject"}));
+                    continue;
+                };
+                let offered = match PublicKey::from_openssh(key_str) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        let _ = write_json_line(writer, &json!({"type":"auth_reject"}));
+                        continue;
+                    }
+                };
+                let Some(authorized) = keys.iter().find(|k| *k == &offered) else {
+                    let _ = write_json_line(writer, &json!({"type":"auth_reject"}));
+                    continue;
+                };
+
+                let _ = write_json_line(writer, &json!({"type":"auth_challenge","challenge": challenge_b64}));
+
+                line.clear();
+                let n = reader.read_line(&mut line)?;
+                if n == 0 {
+                    return Ok(false);
+                }
+                let sig_msg: Value = serde_json::from_str(line.trim())?;
+                if sig_msg["type"] != "auth_sign" {
+                    let _ = write_json_line(writer, &json!({"status":"error","message":"authentication failed"}));
+                    return Ok(false);
+                }
+                let Some(sig_b64) = sig_msg["signature"].as_str() else {
+                    let _ = write_json_line(writer, &json!({"status":"error","message":"authentication failed"}));
+                    return Ok(false);
+                };
+
+                let key_blob = offered.to_bytes()?;
+                let payload = wauth::signed_payload(&challenge, &key_blob);
+
+                if srv_auth::verify_signature(authorized, &payload, sig_b64) {
+                    eprintln!("[+] Control-port auth ok: {} (TCP)", authorized.fingerprint(HashAlg::Sha256));
+                    let _ = write_json_line(writer, &json!({"status":"ok"}));
+                    reader.get_mut().set_read_timeout(Some(Duration::from_secs(5)))?;
+                    return Ok(true);
+                }
+
+                eprintln!("[-] Control-port auth failed: bad signature (TCP)");
+                let _ = write_json_line(writer, &json!({"status":"error","message":"authentication failed"}));
+                return Ok(false);
+            }
+            _ => {
+                // Not an auth message (e.g. an old client sending a command).
+                let _ = write_json_line(writer, &json!({"status":"error","message":"authentication required"}));
+                return Ok(false);
+            }
+        }
+    }
+
+    let _ = write_json_line(writer, &json!({"status":"error","message":"too many authentication attempts"}));
+    Ok(false)
 }
 
 // ── Handle a single control client ─────────────────────────────────────────
 
-pub async fn handle_control(
+/// Handle a `ww` client connected over the Unix control socket (never authenticated).
+pub async fn handle_control_unix(
     stream: tokio::net::UnixStream,
     manager: Arc<Mutex<SessionManager>>,
 ) -> Result<()> {
-    let mut stream: std::os::unix::net::UnixStream = stream.into_std()?;
+    let stream = stream.into_std()?;
+    handle_control_conn(ControlStream::Unix(stream), manager, None).await
+}
+
+/// Handle a `ww` client connected over the optional TCP control port
+/// (`ww-server --control-port`).
+pub async fn handle_control_tcp(
+    stream: tokio::net::TcpStream,
+    manager: Arc<Mutex<SessionManager>>,
+    auth_keys_path: Option<Arc<std::path::PathBuf>>,
+) -> Result<()> {
+    let stream = stream.into_std()?;
+    let keys = auth_keys_path.as_deref().map(std::path::PathBuf::as_path);
+    handle_control_conn(ControlStream::Tcp(stream), manager, keys).await
+}
+
+async fn handle_control_conn(
+    mut stream: ControlStream,
+    manager: Arc<Mutex<SessionManager>>,
+    auth_keys_path: Option<&Path>,
+) -> Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    let mut buf_reader = BufReader::new(&stream);
+
+    let mut writer = stream.try_clone()?;
+    let mut buf_reader = BufReader::new(&mut stream);
+
+    if let Some(path) = auth_keys_path
+        && !authenticate(&mut buf_reader, &mut writer, path)?
+    {
+        return Ok(());
+    }
+
+    // Read the command line.  With no auth configured, tolerate a stray
+    // `auth_offer` from a client that has a key, and tell it auth isn't needed.
     let mut line = String::new();
-    buf_reader.read_line(&mut line)?;
-    if line.is_empty() { return Ok(()); }
+    loop {
+        line.clear();
+        let n = buf_reader.read_line(&mut line)?;
+        if n == 0 {
+            return Ok(());
+        }
+        if auth_keys_path.is_none()
+            && let Ok(v) = serde_json::from_str::<Value>(line.trim())
+            && v["type"] == "auth_offer"
+        {
+            let _ = write_json_line(&mut writer, &json!({"type":"auth_not_required"}));
+            continue;
+        }
+        break;
+    }
+
     let cmd: Command = serde_json::from_str(line.trim())?;
     let action = &cmd.action;
     let push_buffered = buf_reader.buffer().to_vec();
@@ -151,7 +372,7 @@ pub async fn handle_control(
 async fn send_handler(
     cmd: Command,
     manager: &Arc<Mutex<SessionManager>>,
-    stream: &mut std::os::unix::net::UnixStream,
+    stream: &mut ControlStream,
 ) -> Result<()> {
     let id = cmd.id.unwrap_or(0);
     let command = cmd.data.unwrap_or_default().trim().to_string();
@@ -227,7 +448,7 @@ async fn send_handler(
 async fn read_handler(
     cmd: Command,
     manager: &Arc<Mutex<SessionManager>>,
-    stream: &mut std::os::unix::net::UnixStream,
+    stream: &mut ControlStream,
 ) -> Result<()> {
     let id = cmd.id.unwrap_or(0);
     let timeout = cmd.timeout.unwrap_or(0.2);
@@ -254,7 +475,7 @@ async fn read_handler(
 async fn push_handler(
     cmd: Command,
     manager: &Arc<Mutex<SessionManager>>,
-    stream: &mut std::os::unix::net::UnixStream,
+    stream: &mut ControlStream,
     buffered: Vec<u8>,
 ) -> Result<()> {
     let id = cmd.id.unwrap_or(0);
@@ -359,7 +580,7 @@ async fn push_handler(
 async fn pull_handler(
     cmd: Command,
     manager: &Arc<Mutex<SessionManager>>,
-    stream: &mut std::os::unix::net::UnixStream,
+    stream: &mut ControlStream,
 ) -> Result<()> {
     let id = cmd.id.unwrap_or(0);
     let pc: PullCommand = match serde_json::from_str(&cmd.data.unwrap_or_default()) {
@@ -471,10 +692,10 @@ async fn targ_cancel_handler(
 
 // ── Interact handler ────────────────────────────────────────────────────────
 
-/// Spawn a thread that reads from a tokio buf and writes raw bytes to a Unix socket.
+/// Spawn a thread that reads from a tokio buf and writes raw bytes to a control stream.
 fn spawn_buf_to_socket(
     buf: Arc<Mutex<Vec<u8>>>,
-    mut socket: std::os::unix::net::UnixStream,
+    mut socket: ControlStream,
     alive: Arc<AtomicBool>,
     done: Arc<AtomicBool>,
     pc: Arc<AtomicBool>,
@@ -507,10 +728,10 @@ fn spawn_buf_to_socket(
     });
 }
 
-/// Spawn a thread that reads from a Unix socket and writes to a tokio TCP writer.
+/// Spawn a thread that reads from a control stream and writes to a tokio TCP writer.
 /// `framed` — if true, data is wrapped in `FRAME_SHELL`; otherwise raw bytes.
 fn spawn_socket_to_writer(
-    mut socket: std::os::unix::net::UnixStream,
+    mut socket: ControlStream,
     writer: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
     done: Arc<AtomicBool>,
     pc: Arc<AtomicBool>,
@@ -564,7 +785,7 @@ fn spawn_socket_to_writer(
 async fn run_interact_bridge(
     buf: Arc<Mutex<Vec<u8>>>,
     writer: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
-    stream: &mut std::os::unix::net::UnixStream,
+    stream: &mut ControlStream,
     alive: Arc<AtomicBool>,
     framed: bool,
 ) {
@@ -598,7 +819,7 @@ async fn run_interact_bridge(
 async fn interact_handler(
     cmd: Command,
     manager: &Arc<Mutex<SessionManager>>,
-    stream: &mut std::os::unix::net::UnixStream,
+    stream: &mut ControlStream,
 ) -> Result<()> {
     let id = cmd.id.unwrap_or(0);
 

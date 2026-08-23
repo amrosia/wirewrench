@@ -7,6 +7,41 @@ pub const DEFAULT_SOCKET: &str = "/tmp/wirewrench.sock";
 pub const DEFAULT_PORT: u16 = 4444;
 pub const DEFAULT_SMART_PORT: u16 = 4446;
 
+/// SSH-style key authentication for the TCP control port.
+pub mod auth {
+    /// Magic prefix bound into every signature, domain-separating our auth
+    /// protocol from any other use of the same keys.
+    pub const MAGIC: &[u8] = b"wirewrench-auth-v1";
+
+    /// Length of the per-connection random challenge.
+    pub const CHALLENGE_LEN: usize = 32;
+
+    /// Maximum number of key offers a client may make per connection.
+    pub const MAX_OFFERS: usize = 8;
+
+    /// The exact bytes a client signs and the server verifies:
+    /// `MAGIC ‖ challenge ‖ offered public key blob`.
+    pub fn signed_payload(challenge: &[u8], key_blob: &[u8]) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(MAGIC.len() + challenge.len() + key_blob.len());
+        msg.extend_from_slice(MAGIC);
+        msg.extend_from_slice(challenge);
+        msg.extend_from_slice(key_blob);
+        msg
+    }
+
+    /// Base64-encode bytes (standard alphabet, padded).
+    pub fn b64_encode(data: &[u8]) -> String {
+        use base64ct::Encoding;
+        base64ct::Base64::encode_string(data)
+    }
+
+    /// Base64-decode; `None` on invalid input.
+    pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
+        use base64ct::Encoding;
+        base64ct::Base64::decode_vec(s).ok()
+    }
+}
+
 #[derive(Deserialize)]
 pub struct Command {
     pub action: String,

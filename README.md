@@ -4,6 +4,10 @@
 
 WireWrench is a complete rework of the original single-binary REPL into a full client-server remote shell toolkit with a smart agent (`ww-target`) for reliable command execution and file transfer.
 
+By default `ww` talks to `ww-server` over a Unix socket.  Run `ww-server --control-port <PORT>`
+to **also** accept `ww` clients over TCP, then point `ww` at it with `-H <host>:<port>` — useful
+when the client and server are on different machines.
+
 ## Architecture
 
 ```
@@ -11,11 +15,12 @@ WireWrench is a complete rework of the original single-binary REPL into a full c
 │   ww (client)   │ ◄───────────────► │  ww-server       │ ◄──────────────► │ dumb shell  │
 │                 │   JSON over socket │  (daemon)         │   raw TCP        │ (ncat, bash)│
 │  • list shells  │                    │                  │                  └─────────────┘
-│  • send cmd     │                    │  • TCP listener  │
-│  • interact     │                    │  • Smart agent   │     TCP :4446     ┌─────────────┐
-│  • script file  │                    │  • Session mgmt  │ ◄──────────────► │ ww-target   │
+│  • send cmd     │   TCP control (opt)│  • TCP listener  │
+│  • interact     │ ◄───────────────►  │  • Smart agent   │     TCP :4446     ┌─────────────┐
+│  • script file  │  ww -H host:4445   │  • Session mgmt  │ ◄──────────────► │ ww-target   │
 │  • targ push    │                    │  • File transfer │   framed protocol │ (smart agent)│
 │  • targ pull    │                    │  • Unix socket   │                  └─────────────┘
+│                 │                    │  • TCP control   │
 └─────────────────┘                    └──────────────────┘
 ```
 
@@ -116,13 +121,21 @@ ww-server -p 5555                  # custom TCP port for dumb shells
 ww-server -P 5556                  # custom smart port for ww-target
 ww-server -H 0.0.0.0 -p 8080      # custom host and port
 ww-server -s /tmp/ww.sock          # custom socket path
+ww-server -c 4445                  # also accept ww clients over TCP (:4445, in addition to the socket)
+ww-server -c 4445 -k ~/.ssh/authorized_keys   # ...and require SSH key auth on that port
 ```
 
 ### Client — Shell Commands
 
 ```bash
+# Local control (default): Unix socket at /tmp/wirewrench.sock
 # List active shells (ww-target sessions show their platform, e.g. windows/x86_64)
 ww list
+
+# Remote control over TCP (server must run with `ww-server --control-port`)
+ww -H 10.0.0.5:4445 list        # host and port together; the port is required
+ww -H 10.0.0.5:4445 send 1 "uname -a"
+ww -H 10.0.0.5:4445 -i ~/.ssh/id_ed25519 list   # authenticate with a private key
 
 # Send a command (smart agent: waits until command finishes; dumb shell: polls with timeout)
 ww send 1 "uname -a"
@@ -155,6 +168,52 @@ ww targ upload -t 60 1 ./big-file.bin /tmp/big-file.bin
 # Cancel an ongoing transfer
 ww targ cancel 1
 ```
+
+## Control-port authentication
+
+When the TCP control port is exposed to a network (`ww-server -c`), you can
+require SSH-style public-key authentication.  The Unix socket is **never**
+authenticated — keys apply only to the TCP control listener.
+
+```bash
+# Server: authorize public keys (a single authorized_keys-style file, or a
+# folder of such files — one key per line)
+ww-server -c 4445 -k ~/.ssh/authorized_keys
+
+# Client: present the matching private key (like ssh -i)
+ww -H 10.0.0.5:4445 -i ~/.ssh/id_ed25519 send 1 "uname -a"
+```
+
+- **Key types**: ed25519, RSA, ECDSA — anything `ssh-keygen` produces.
+- **Passphrases**: encrypted private keys prompt for a passphrase on the terminal.
+- **Without `-k`**, `ww-server -c` still runs but prints a loud
+  `⚠ WARNING` that the control port is unauthenticated.
+- **Errors**: connecting without a key to an authenticated server, or offering
+  the wrong key, fails with a clear, non-zero-exit message.
+
+Default key locations can be stored instead of passing flags every time:
+
+```ini
+# ~/.config/wirewrench/server.conf
+control_public_keys = ~/.ssh/authorized_keys
+```
+
+```ini
+# ~/.config/wirewrench/client.conf
+host = 10.0.0.5:4445    # default control target (HOST:PORT); overridden by -H
+identity = ~/.ssh/id_ed25519
+# several keys are tried in order:
+identity = ~/.ssh/id_rsa
+```
+
+With these set, a plain `ww list` / `ww send 1 "cmd"` connects over TCP to
+the configured host using the configured key — no flags needed.  Explicit
+`-H`/`-i` always override the config values.
+
+The handshake mirrors ssh: the client offers a public key, the server replies
+with a fresh per-connection challenge, the client signs it with the private
+key, and the server verifies the signature against the authorized key set —
+which is re-read on every connection, so key rotation needs no restart.
 
 ## Smart Agent (`ww-target`)
 

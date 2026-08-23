@@ -1,5 +1,20 @@
 # Changelog
 
+## v3.2.0 — TCP control channel & key authentication
+
+- **Optional TCP control channel** — `ww-server -c/--control-port <PORT>` also listens
+  for `ww` client connections over TCP (in addition to the Unix socket, which always
+  stays active); `ww -H <host>:<port>` connects over TCP instead of the socket — the
+  port is mandatory (no default)
+- **SSH-style key authentication for the control port** — `ww-server -k/--auth-keys
+  <FILE|DIR>` (requires `-c`) authorizes ed25519/RSA/ECDSA public keys in ssh
+  `authorized_keys` format; `ww -i/--identity <KEY>` authenticates with a private key
+  (encrypted keys prompt for a passphrase). Running `-c` without `-k` prints a loud
+  unauthenticated warning; keys never apply to the Unix socket.
+- **Config files** — `~/.config/wirewrench/server.conf` (`control_public_keys`) and
+  `~/.config/wirewrench/client.conf` (`identity`, repeatable; `host = HOST:PORT` for a
+  default control target) store default paths.  Explicit flags override config values.
+
 ## v3.1.0 — Cross-platform `ww-target`
 
 - **`ww-target` is now cross-platform**: builds and runs on Linux, macOS, and Windows
