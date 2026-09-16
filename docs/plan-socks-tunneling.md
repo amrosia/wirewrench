@@ -1,6 +1,10 @@
 # Plan: TCP tunneling / SOCKS5 through `ww-target`
 
-Draft. Nothing implemented, nothing committed, no version bump.
+**Status: implemented — v3.4.0 (P1–P4), review fixes in v3.4.1.**  See
+`CHANGELOG.md` and §13 ("Where the shipped code differs from this plan").  There
+was never a `v3.3.0` release: the "P1+P2+P3 → 3.3.0" split below was folded into
+the single 3.4.0 release, and the version numbers in §11 are therefore history,
+not a promise.
 
 **Goal.** Reach hosts only the target can reach: `ww forward` (one port) and `ww socks`
 (SOCKS5 proxy), both dialing from `ww-target`.
@@ -62,6 +66,10 @@ Files: `src/bin/target.rs` only. **Do this before any tunnel code.**
   (`pull_pump` sends one `FRAME_FILE_DATA` chunk per call, then `push_done`).
 - **P1.4 Bounded queues.** `std::sync::mpsc::sync_channel(1024)` for `Outbound`; on `send`
   error (writer thread died) bail out of `run_session`.
+  *As shipped:* the inbound (socket → dispatcher) queue is bounded as well —
+  `sync_channel(INBOUND_QUEUE)`, 256 frames — and every tunnel stream owns a bounded writer queue
+  (`TUNNEL_WRITE_QUEUE`, 64 commands) driven by its own thread, so a stalled destination cannot
+  block the dispatcher.
 - **P1.5 Regression test.** In `tests/e2e_target.sh`, before the fix: start a background output
   loop on the target (`ww send 1 "nohup sh -c 'while :; do echo tick; sleep 0.01; done' &"`),
   then `ww targ upload` a ~5 MB file and assert the hash verifies and the session is still
@@ -77,8 +85,11 @@ Files: `src/bin/target.rs` only. **Do this before any tunnel code.**
   `tunnels: Arc<Mutex<HashMap<u32, mpsc::Sender<TunnelEvent>>>>`,
   `next_stream_id: AtomicU32`.
 - In the reader task (`SmartSession::new`), add arms: `FRAME_TUNNEL_OPENED/DATA/EOF/CLOSE` →
-  look up `tunnels` by `stream_id` and `try_send` the event (skip when absent; on full, drop the
-  sender and send `Closed("consumer too slow")`). Keep `FRAME_FILE_*` on `ctrl_queue`.
+  look up `tunnels` by `stream_id` and `try_send` the event (skip when absent; on full, record the
+  reason out-of-band on `TunnelEntry::overflow`, then drop the sender so the relay unblocks and
+  reports `consumer too slow` instead of `session closed`). Keep `FRAME_FILE_*` on `ctrl_queue`.
+  *As shipped:* the reason is recorded before the sender is dropped and read back by the relay —
+  see `session.rs::deliver_tunnel` and `handlers.rs::relay_tunnel_inner`.
 - **Session death must wake every relay.** A relay blocked in `rx.recv()` never re-checks
   `alive`. When the reader task exits, `std::mem::take(&mut *tunnels.lock().await)` and drop all
   senders → every relay sees `None` and closes its control connection (e2e case 19).
@@ -98,8 +109,13 @@ Files: `src/bin/target.rs` only. **Do this before any tunnel code.**
   - `TcpStream::connect_timeout` per resolved addr (`ToSocketAddrs`, budget
     `o.connect_timeout`), `set_nodelay(true)`, `set_read_timeout(1s)`, `set_write_timeout(10s)`;
   - on failure → `TunnelOpened{ok:false, errno: err.raw_os_error(), message}`;
-  - on success → insert stream, `TunnelOpened{ok:true, bound: local_addr}`, and
-    `spawn_tunnel_reader(id, dest.try_clone()?, out.clone(), last_activity.clone())`.
+  - on success → insert stream, 
+    `TunnelOpened{ok:true, bound: local_addr}`, and *only then* start the read half:
+    `spawn_tunnel_reader(id, dest.try_clone()?, out.clone(), last_activity.clone())`.  `OPENED`
+    must be the first frame of the stream — both producers share one FIFO outbound queue, so
+    starting the reader first would let a destination that speaks first race its own `OPENED`.
+    *As shipped:* the socket's write half belongs to a per-stream writer thread started before the
+    announcement (`spawn_tunnel_writer`), and the reader starts after it.
 - `fn spawn_tunnel_reader(stream_id, dest, out, last_activity)`: loop
   `read` → `out.send(FRAME_TUNNEL_DATA, tunnel_data_payload(id, chunk))`;
   `Ok(0)` → `FRAME_TUNNEL_EOF`; error → `FRAME_TUNNEL_CLOSE`. On `ReadTimeout`, if
@@ -123,17 +139,20 @@ Files: `src/bin/target.rs` only. **Do this before any tunnel code.**
 **P3.2 Server action — `src/bin/server/handlers.rs`**
 - Add `#[derive(serde::Deserialize)] struct ConnectCommand { host: String, port: u16, #[serde(default = "def_timeout")] timeout: f64 }`.
 - **Remove the `BufReader`** from `handle_control_conn` and replace it with
-  `fn read_json_line(stream: &mut ControlStream) -> Result<(Command, Vec<u8>)>` reading
-  byte-at-a-time up to 64 KiB (returns over-read bytes = early tunnel bytes). This also lets
-  `push_handler` drop its `buffered: Vec<u8>` parameter and the `buf_reader.buffer()` hack.
+  `fn read_line_raw(stream: &mut ControlStream) -> Result<Vec<u8>>` reading byte-at-a-time up to
+  64 KiB.  *As shipped:* the helper returns only the line — a byte-at-a-time read cannot
+  over-read, so there are no "early tunnel bytes" to hand on, and `connect_handler` builds its own
+  prefix if a target nevertheless sends `DATA` before `OPENED`.  This also lets `push_handler`
+  drop its `buffered: Vec<u8>` parameter and the `buf_reader.buffer()` hack.
   **`authenticate()` must use the same helper** instead of its own `BufReader`: a dropped
   `BufReader` can swallow bytes belonging to the next message, which would hang the action read
   and silently drop any pipelined bytes after it. After this change no control connection uses
   `BufReader`, which removes that whole bug class.
 - New arm in the `match action.as_str()` dispatch:
-  `"connect" => return connect_handler(cmd, manager, stream, leftover).await,`
+  `"connect" => return connect_handler(cmd, manager, stream).await,`
   (takes `stream` **by value** — other arms keep `&mut stream`).
-- `fn connect_handler(cmd, manager, mut stream: ControlStream, leftover: Vec<u8>) -> Result<()>`:
+- `fn connect_handler(cmd, manager, mut stream: ControlStream) -> Result<()>` (`leftover` is
+  built inside, from any early `DATA` event):
   1. `ConnectCommand` from `cmd.data`; enforce `MAX_TUNNELS_PER_SESSION` (`const … = 64`).
   2. Look up `ManagedSession::Smart`, check `alive` and `s.supports_tunnels` (else
      `{"status":"error","message":"target agent does not support tunneling — upgrade ww-target"}`).
@@ -272,7 +291,10 @@ Document, don't fix: TCP only (proxychains is too); nmap needs `-sT -Pn` + numer
   `reply_code_from_errno` over both the Unix errno and WinSock tables (a Windows `ww-target`
   otherwise degrades every failure to `0x01`).
 - E2E — append to `tests/e2e_target.sh` (reuse its `pass`/`fail`/`header` helpers and the
-  `XDG_CONFIG_HOME` isolation; start `python3 -m http.server 8000` in the background):
+  `XDG_CONFIG_HOME` isolation; start `python3 -m http.server 8000` in the background).
+  *As shipped* these live in the script as **cases 13–20**, whose numbering does not match the
+  list below: the script merged some cases, added the P1 concurrent-upload regression as case 13,
+  and `src/bin/target.rs` refers to the `WW_NO_TUNNEL` hook as *e2e case 18* (not 20):
   13. `ww forward 1 -L 127.0.0.1:8080:127.0.0.1:8000` + `curl` → body matches. Run once over the
       Unix socket and once over the TCP control port (reuse tests 10–12's setup) to cover the
       post-auth byte path.
@@ -298,14 +320,41 @@ Document, don't fix: TCP only (proxychains is too); nmap needs `-sT -Pn` + numer
 
 ## 11. Release & docs
 
+- *As shipped:* everything (P1–P4) went out in **3.4.0** — there is no `v3.3.0` tag or
+  release.  The split below is what was planned, not what happened; ignore it when checking
+  compatibility and use the `tunnel` handshake feature instead of a version number.
 - P1+P2+P3 → `Cargo.toml` `version = "3.3.0"`, `CHANGELOG.md` entry, README (protocol table
   +5 rows, `features` note, "Pivoting" section), commit, tag `v3.3.0`, push (AGENTS.md).
-- P4 → `3.4.0` (protocol unchanged, so 3.3.0 agents keep working), same procedure.
+- P4 → `3.4.0` (protocol unchanged, so pre-tunneling agents keep working), same procedure.
 - README must state: `ww socks` warns if bound off-loopback; proxychains/nmap caveats (§9);
-  tunnels need `ww-target` ≥ 3.3.0.
+  tunnels need an agent that advertises the `tunnel` feature (shipped in 3.4.0).
+- *As shipped:* a follow-up release (3.4.1) fixed the review findings — SOCKS5 auth bypass,
+  HTTP CONNECT bypassing that auth, `OPENED`/`DATA` ordering, per-stream write queues,
+  bounded queues, teardown leaks, resource caps, and a handshake deadline.
 
 ## 12. Caveats to document
 
 1. **No UDP/ICMP** — no QUIC/WireGuard/UDP DNS through the tunnel.
 2. Shared single link: heavy or stalled streams affect or reset each other; target reconnect
-   kills open streams (listener survives).
+   kills open streams (listener survives).  *As shipped* a stream whose per-stream write queue
+   overflows is reset (reason `stream stalled`) rather than allowed to block the others.
+
+## 13. Where the shipped code differs from this plan
+
+1. **Version numbers.**  No 3.3.0 release (§11); one 3.4.0 release for P1–P4, then 3.4.1 for the
+   review fixes.
+2. **`read_line_raw`, not `read_json_line`.**  The helper returns only the line: byte-at-a-time
+   reads cannot over-read, so there are no leftover bytes to thread through.  `connect_handler`
+   builds its own early-data prefix if a target sends `DATA` before `OPENED` (§4).
+3. **Overflow reporting.**  A full per-stream event queue cannot carry a `Closed(...)` message
+   (that is what made the original wording self-contradictory).  The reason is recorded on
+   `TunnelEntry::overflow` just before the sender is dropped, and the relay reports it (§3).
+4. **Tunnel stream I/O threads.**  Each stream has a reader thread and a writer thread; the
+   writer owns the socket's write half and has a bounded command queue, so a stalled destination
+   resets that stream instead of blocking the dispatcher (§3).
+5. **Close reasons.**  `stream stalled` (agent), `consumer too slow` (server), `write timeout`,
+   `refusing to dial own server` — used instead of a single generic reason.
+6. **Extra limits not in the plan:** `MAX_FRAME_PAYLOAD` (8 MiB), `MAX_PUSH_SIZE` (512 MiB),
+   `MAX_CONCURRENT_CMDS`/`MAX_CMD_OUTPUT` on the agent, `MAX_LOCAL_CONNS` in `ww`, and the
+   handshake `Deadline` in `src/socks.rs`.
+7. **E2E numbering** (§10) does not match `tests/e2e_target.sh` cases 13–20.

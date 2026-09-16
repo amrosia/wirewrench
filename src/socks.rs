@@ -6,11 +6,35 @@
 
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::time::{Duration, Instant};
 
 /// SOCKS5 reply code: address type not supported.
 pub const ATYP_NOT_SUPPORTED: u8 = 0x08;
 /// SOCKS5 reply code: command not supported.
 pub const CMD_NOT_SUPPORTED: u8 = 0x07;
+
+/// Wall-clock budget for one handshake.
+///
+/// Every byte read checks the deadline, so a peer that dribbles one byte at a
+/// time cannot keep a thread alive indefinitely.  A single `read` may still
+/// block for the socket's own read timeout, so the effective bound is
+/// `budget + read timeout`.
+#[derive(Debug, Clone, Copy)]
+pub struct Deadline {
+    at: Instant,
+}
+
+impl Deadline {
+    #[must_use]
+    pub fn after(budget: Duration) -> Self {
+        Self { at: Instant::now() + budget }
+    }
+
+    #[must_use]
+    pub fn expired(&self) -> bool {
+        Instant::now() >= self.at
+    }
+}
 
 /// The protocol a local client speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,12 +62,14 @@ pub struct Request {
 }
 
 /// Protocol-level error.  `Code` carries the SOCKS5 reply code to send before
-/// closing; `NotConnect` means "reply HTTP 501".
+/// closing; `NotConnect` means "reply HTTP 501"; `Timeout` means the handshake
+/// budget expired.
 #[derive(Debug)]
 pub enum Error {
     Io(std::io::Error),
     Code(u8),
     NotConnect,
+    Timeout,
 }
 
 impl From<std::io::Error> for Error {
@@ -58,6 +84,7 @@ impl std::fmt::Display for Error {
             Error::Io(e) => write!(f, "io error: {e}"),
             Error::Code(c) => write!(f, "protocol error (reply 0x{c:02x})"),
             Error::NotConnect => write!(f, "not an HTTP CONNECT request"),
+            Error::Timeout => write!(f, "handshake deadline expired"),
         }
     }
 }
@@ -66,12 +93,54 @@ impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// SOCKS5 method selection.  `auth` enables username/password (RFC 1929);
-/// no-auth is always offered.  Returns `false` when the client was rejected
-/// (a reply has already been written).
-pub fn greet<S: Read + Write>(s: &mut S, auth: Option<(&str, &str)>) -> Result<bool> {
+/// `read_exact` that honours a [`Deadline`].  Unlike `Read::read_exact` it does
+/// not retry forever on a slow peer, and it reports a clean [`Error::Timeout`].
+fn read_exact<S: Read>(s: &mut S, buf: &mut [u8], deadline: Deadline) -> Result<()> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        if deadline.expired() {
+            return Err(Error::Timeout);
+        }
+        match s.read(&mut buf[filled..]) {
+            Ok(0) => {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed",
+                )));
+            }
+            Ok(n) => filled += n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(Error::Io(e)),
+        }
+    }
+    Ok(())
+}
+
+/// Constant-time byte comparison, used for the RFC 1929 credentials so the
+/// comparison does not leak how many leading bytes matched.
+#[must_use]
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0_u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// SOCKS5 method selection.  `auth` enables username/password (RFC 1929); when
+/// it is set, authentication is **required** and a client offering only
+/// "no authentication" is rejected with `0xFF` (RFC 1928).  Returns `false`
+/// when the client was rejected (a reply has already been written).
+pub fn greet<S: Read + Write>(
+    s: &mut S,
+    auth: Option<(&str, &str)>,
+    deadline: Deadline,
+) -> Result<bool> {
     let mut head = [0_u8; 2];
-    s.read_exact(&mut head)?;
+    read_exact(s, &mut head, deadline)?;
     if head[0] != 0x05 {
         // Unsupported version: NO ACCEPTABLE METHODS.
         s.write_all(&[0x05, 0xFF])?;
@@ -80,10 +149,12 @@ pub fn greet<S: Read + Write>(s: &mut S, auth: Option<(&str, &str)>) -> Result<b
     }
     let nmethods = head[1] as usize;
     let mut methods = vec![0_u8; nmethods];
-    s.read_exact(&mut methods)?;
+    read_exact(s, &mut methods, deadline)?;
 
-    let method = if auth.is_some() && methods.contains(&0x02) {
-        0x02
+    // When credentials are configured, auth is mandatory: silently accepting
+    // 0x00 here would make `--socks-user/--socks-pass` a no-op.
+    let method = if auth.is_some() {
+        if methods.contains(&0x02) { 0x02 } else { 0xFF }
     } else if methods.contains(&0x00) {
         0x00
     } else {
@@ -94,28 +165,35 @@ pub fn greet<S: Read + Write>(s: &mut S, auth: Option<(&str, &str)>) -> Result<b
 
     match method {
         0xFF => Ok(false),
-        0x02 => userpass_auth(s, auth.unwrap()),
+        0x02 => match auth {
+            Some(creds) => userpass_auth(s, creds, deadline),
+            None => Ok(false),
+        },
         _ => Ok(true),
     }
 }
 
 /// RFC 1929 username/password sub-negotiation.
-fn userpass_auth<S: Read + Write>(s: &mut S, (user, pass): (&str, &str)) -> Result<bool> {
+fn userpass_auth<S: Read + Write>(
+    s: &mut S,
+    (user, pass): (&str, &str),
+    deadline: Deadline,
+) -> Result<bool> {
     let mut head = [0_u8; 2];
-    s.read_exact(&mut head)?;
+    read_exact(s, &mut head, deadline)?;
     if head[0] != 0x01 {
         s.write_all(&[0x01, 0x01])?;
         s.flush()?;
         return Ok(false);
     }
     let mut username = vec![0_u8; head[1] as usize];
-    s.read_exact(&mut username)?;
+    read_exact(s, &mut username, deadline)?;
     let mut plen = [0_u8; 1];
-    s.read_exact(&mut plen)?;
+    read_exact(s, &mut plen, deadline)?;
     let mut password = vec![0_u8; plen[0] as usize];
-    s.read_exact(&mut password)?;
+    read_exact(s, &mut password, deadline)?;
 
-    let ok = username == user.as_bytes() && password == pass.as_bytes();
+    let ok = ct_eq(&username, user.as_bytes()) && ct_eq(&password, pass.as_bytes());
     s.write_all(&[0x01, if ok { 0x00 } else { 0x01 }])?;
     s.flush()?;
     Ok(ok)
@@ -124,10 +202,14 @@ fn userpass_auth<S: Read + Write>(s: &mut S, (user, pass): (&str, &str)) -> Resu
 /// Read a SOCKS5 CONNECT request.  `ATYP 0x03` is passed through as a
 /// hostname (the target resolves it).  `BIND`/`UDP ASSOCIATE` and unknown
 /// address types yield the matching reply code.
-pub fn read_request<S: Read + Write>(s: &mut S) -> Result<Request> {
+pub fn read_request<S: Read + Write>(s: &mut S, deadline: Deadline) -> Result<Request> {
     let mut head = [0_u8; 4];
-    s.read_exact(&mut head)?;
+    read_exact(s, &mut head, deadline)?;
     if head[0] != 0x05 {
+        return Err(Error::Code(0x01));
+    }
+    if head[2] != 0x00 {
+        // RSV must be zero (RFC 1928 §4).
         return Err(Error::Code(0x01));
     }
     let cmd = head[1];
@@ -139,14 +221,18 @@ pub fn read_request<S: Read + Write>(s: &mut S) -> Result<Request> {
     let host = match atyp {
         0x01 => {
             let mut b = [0_u8; 4];
-            s.read_exact(&mut b)?;
+            read_exact(s, &mut b, deadline)?;
             Ipv4Addr::from(b).to_string()
         }
         0x03 => {
             let mut l = [0_u8; 1];
-            s.read_exact(&mut l)?;
+            read_exact(s, &mut l, deadline)?;
+            if l[0] == 0 {
+                // A zero-length domain name can never be dialled.
+                return Err(Error::Code(0x01));
+            }
             let mut d = vec![0_u8; l[0] as usize];
-            s.read_exact(&mut d)?;
+            read_exact(s, &mut d, deadline)?;
             match String::from_utf8(d) {
                 Ok(h) => h,
                 Err(_) => return Err(Error::Code(0x01)),
@@ -154,14 +240,14 @@ pub fn read_request<S: Read + Write>(s: &mut S) -> Result<Request> {
         }
         0x04 => {
             let mut b = [0_u8; 16];
-            s.read_exact(&mut b)?;
+            read_exact(s, &mut b, deadline)?;
             Ipv6Addr::from(b).to_string()
         }
         _ => return Err(Error::Code(ATYP_NOT_SUPPORTED)),
     };
 
     let mut port = [0_u8; 2];
-    s.read_exact(&mut port)?;
+    read_exact(s, &mut port, deadline)?;
     Ok(Request { host, port: u16::from_be_bytes(port) })
 }
 
@@ -171,9 +257,12 @@ pub fn write_reply<S: Write>(s: &mut S, code: u8) {
     let _ = s.flush();
 }
 
+/// Maximum number of header lines accepted in an HTTP CONNECT request.
+pub const MAX_HTTP_HEADERS: usize = 64;
+
 /// Read an HTTP `CONNECT host:port HTTP/1.1` request plus its headers.
-pub fn read_http_connect<S: Read + Write>(s: &mut S) -> Result<Request> {
-    let line = read_line(s)?;
+pub fn read_http_connect<S: Read + Write>(s: &mut S, deadline: Deadline) -> Result<Request> {
+    let line = read_line(s, deadline)?;
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
@@ -187,11 +276,20 @@ pub fn read_http_connect<S: Read + Write>(s: &mut S) -> Result<Request> {
         target.rsplit_once(':').ok_or(Error::Code(0x01))?
     };
     let port: u16 = port_str.parse().map_err(|_| Error::Code(0x01))?;
+    if host.is_empty() {
+        return Err(Error::Code(0x01));
+    }
 
-    // Consume headers up to the blank line.
+    // Consume headers up to the blank line, bounded so a peer cannot stream
+    // header lines forever.
+    let mut headers = 0_usize;
     loop {
-        if read_line(s)?.is_empty() {
+        if read_line(s, deadline)?.is_empty() {
             break;
+        }
+        headers += 1;
+        if headers > MAX_HTTP_HEADERS {
+            return Err(Error::Code(0x01));
         }
     }
     Ok(Request { host: host.to_string(), port })
@@ -203,12 +301,13 @@ pub fn write_http_reply<S: Write>(s: &mut S, code: u16, reason: &str) {
     let _ = s.flush();
 }
 
-/// Read one CRLF-terminated line, byte-at-a-time (never over-reads).
-fn read_line<S: Read>(s: &mut S) -> Result<String> {
+/// Read one CRLF-terminated line, byte-at-a-time (never over-reads) and within
+/// `deadline`.
+fn read_line<S: Read>(s: &mut S, deadline: Deadline) -> Result<String> {
     let mut buf = Vec::new();
     let mut b = [0_u8; 1];
     loop {
-        s.read_exact(&mut b)?;
+        read_exact(s, &mut b, deadline)?;
         if b[0] == b'\n' {
             break;
         }
@@ -248,6 +347,11 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    /// A generous budget for fixtures that are expected to answer promptly.
+    fn dl() -> Deadline {
+        Deadline::after(Duration::from_secs(5))
+    }
+
     /// A duplex-ish fixture: writes are appended to `out`, reads come from `input`.
     struct Fixture {
         input: Cursor<Vec<u8>>,
@@ -285,7 +389,7 @@ mod tests {
     #[test]
     fn greet_no_auth() {
         let mut f = Fixture::new(&[0x05, 0x01, 0x00]);
-        assert!(greet(&mut f, None).unwrap());
+        assert!(greet(&mut f, None, dl()).unwrap());
         assert_eq!(f.out, vec![0x05, 0x00]);
     }
 
@@ -294,7 +398,7 @@ mod tests {
         let mut input = vec![0x05, 0x02, 0x00, 0x02];
         input.extend_from_slice(&[0x01, 3, b'b', b'o', b'b', 4, b'p', b'a', b's', b's']);
         let mut f = Fixture::new(&input);
-        assert!(greet(&mut f, Some(("bob", "pass"))).unwrap());
+        assert!(greet(&mut f, Some(("bob", "pass")), dl()).unwrap());
         assert_eq!(f.out, vec![0x05, 0x02, 0x01, 0x00]);
     }
 
@@ -303,29 +407,57 @@ mod tests {
         let mut input = vec![0x05, 0x01, 0x02];
         input.extend_from_slice(&[0x01, 3, b'b', b'o', b'b', 4, b'p', b'a', b's', b's']);
         let mut f = Fixture::new(&input);
-        assert!(!greet(&mut f, Some(("bob", "wrong"))).unwrap());
+        assert!(!greet(&mut f, Some(("bob", "wrong")), dl()).unwrap());
         assert_eq!(f.out, vec![0x05, 0x02, 0x01, 0x01]);
+    }
+
+    /// Regression: credentials are configured, but the client only offers
+    /// "no authentication".  The server must refuse (0xFF), not fall back to
+    /// no-auth, otherwise `--socks-user/--socks-pass` is a no-op.
+    #[test]
+    fn greet_userpass_required_rejects_no_auth_client() {
+        let mut f = Fixture::new(&[0x05, 0x01, 0x00]);
+        assert!(!greet(&mut f, Some(("bob", "secret")), dl()).unwrap());
+        assert_eq!(f.out, vec![0x05, 0xFF]);
+    }
+
+    /// Same, when the client offers an unrelated method as well.
+    #[test]
+    fn greet_userpass_required_rejects_unknown_method() {
+        let mut f = Fixture::new(&[0x05, 0x02, 0x00, 0x01]);
+        assert!(!greet(&mut f, Some(("bob", "secret")), dl()).unwrap());
+        assert_eq!(f.out, vec![0x05, 0xFF]);
     }
 
     #[test]
     fn greet_no_acceptable_method() {
         let mut f = Fixture::new(&[0x05, 0x01, 0x01]);
-        assert!(!greet(&mut f, None).unwrap());
+        assert!(!greet(&mut f, None, dl()).unwrap());
         assert_eq!(f.out, vec![0x05, 0xFF]);
     }
 
     #[test]
     fn greet_bad_version() {
         let mut f = Fixture::new(&[0x04, 0x01, 0x00]);
-        assert!(!greet(&mut f, None).unwrap());
+        assert!(!greet(&mut f, None, dl()).unwrap());
         assert_eq!(f.out, vec![0x05, 0xFF]);
+    }
+
+    #[test]
+    fn greet_deadline_expired() {
+        let mut f = Fixture::new(&[0x05, 0x01, 0x00]);
+        assert!(matches!(
+            greet(&mut f, None, Deadline::after(Duration::ZERO)),
+            Err(Error::Timeout)
+        ));
+        assert!(f.out.is_empty());
     }
 
     #[test]
     fn request_atyp_ipv4() {
         let mut f = Fixture::new(&[0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0x1F, 0x90]);
         assert_eq!(
-            read_request(&mut f).unwrap(),
+            read_request(&mut f, dl()).unwrap(),
             Request { host: "127.0.0.1".into(), port: 8080 }
         );
     }
@@ -337,7 +469,7 @@ mod tests {
         input.extend_from_slice(&[0x00, 0x50]);
         let mut f = Fixture::new(&input);
         assert_eq!(
-            read_request(&mut f).unwrap(),
+            read_request(&mut f, dl()).unwrap(),
             Request { host: "example.com".into(), port: 80 }
         );
     }
@@ -349,7 +481,7 @@ mod tests {
         input.extend_from_slice(&[0x01, 0xBB]);
         let mut f = Fixture::new(&input);
         assert_eq!(
-            read_request(&mut f).unwrap(),
+            read_request(&mut f, dl()).unwrap(),
             Request { host: "::1".into(), port: 443 }
         );
     }
@@ -357,31 +489,43 @@ mod tests {
     #[test]
     fn request_bind_rejected() {
         let mut f = Fixture::new(&[0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
-        assert!(matches!(read_request(&mut f), Err(Error::Code(CMD_NOT_SUPPORTED))));
+        assert!(matches!(read_request(&mut f, dl()), Err(Error::Code(CMD_NOT_SUPPORTED))));
     }
 
     #[test]
     fn request_udp_rejected() {
         let mut f = Fixture::new(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
-        assert!(matches!(read_request(&mut f), Err(Error::Code(CMD_NOT_SUPPORTED))));
+        assert!(matches!(read_request(&mut f, dl()), Err(Error::Code(CMD_NOT_SUPPORTED))));
     }
 
     #[test]
     fn request_unknown_atyp() {
         let mut f = Fixture::new(&[0x05, 0x01, 0x00, 0x09]);
-        assert!(matches!(read_request(&mut f), Err(Error::Code(ATYP_NOT_SUPPORTED))));
+        assert!(matches!(read_request(&mut f, dl()), Err(Error::Code(ATYP_NOT_SUPPORTED))));
     }
 
     #[test]
     fn request_bad_version() {
         let mut f = Fixture::new(&[0x04, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0, 80]);
-        assert!(matches!(read_request(&mut f), Err(Error::Code(0x01))));
+        assert!(matches!(read_request(&mut f, dl()), Err(Error::Code(0x01))));
+    }
+
+    #[test]
+    fn request_nonzero_rsv_rejected() {
+        let mut f = Fixture::new(&[0x05, 0x01, 0xFF, 0x01, 127, 0, 0, 1, 0, 80]);
+        assert!(matches!(read_request(&mut f, dl()), Err(Error::Code(0x01))));
+    }
+
+    #[test]
+    fn request_empty_domain_rejected() {
+        let mut f = Fixture::new(&[0x05, 0x01, 0x00, 0x03, 0, 0x00, 0x50]);
+        assert!(matches!(read_request(&mut f, dl()), Err(Error::Code(0x01))));
     }
 
     #[test]
     fn request_truncated() {
         let mut f = Fixture::new(&[0x05, 0x01]);
-        assert!(matches!(read_request(&mut f), Err(Error::Io(_))));
+        assert!(matches!(read_request(&mut f, dl()), Err(Error::Io(_))));
     }
 
     #[test]
@@ -396,7 +540,7 @@ mod tests {
         let input = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n";
         let mut f = Fixture::new(input);
         assert_eq!(
-            read_http_connect(&mut f).unwrap(),
+            read_http_connect(&mut f, dl()).unwrap(),
             Request { host: "example.com".into(), port: 443 }
         );
     }
@@ -404,19 +548,30 @@ mod tests {
     #[test]
     fn http_connect_not_connect() {
         let mut f = Fixture::new(b"GET http://example.com/ HTTP/1.1\r\n\r\n");
-        assert!(matches!(read_http_connect(&mut f), Err(Error::NotConnect)));
+        assert!(matches!(read_http_connect(&mut f, dl()), Err(Error::NotConnect)));
     }
 
     #[test]
     fn http_connect_malformed_target() {
         let mut f = Fixture::new(b"CONNECT noport HTTP/1.1\r\n\r\n");
-        assert!(matches!(read_http_connect(&mut f), Err(Error::Code(0x01))));
+        assert!(matches!(read_http_connect(&mut f, dl()), Err(Error::Code(0x01))));
     }
 
     #[test]
     fn http_connect_truncated() {
         let mut f = Fixture::new(b"CONNECT example.com:443 HTTP/1.1\r\n");
-        assert!(matches!(read_http_connect(&mut f), Err(Error::Io(_))));
+        assert!(matches!(read_http_connect(&mut f, dl()), Err(Error::Io(_))));
+    }
+
+    #[test]
+    fn http_connect_too_many_headers() {
+        let mut input = b"CONNECT example.com:443 HTTP/1.1\r\n".to_vec();
+        for _ in 0..MAX_HTTP_HEADERS + 2 {
+            input.extend_from_slice(b"X-Pad: 1\r\n");
+        }
+        input.extend_from_slice(b"\r\n");
+        let mut f = Fixture::new(&input);
+        assert!(matches!(read_http_connect(&mut f, dl()), Err(Error::Code(0x01))));
     }
 
     #[test]
@@ -427,6 +582,14 @@ mod tests {
             String::from_utf8(f.out).unwrap(),
             "HTTP/1.1 200 Connection established\r\n\r\n"
         );
+    }
+
+    #[test]
+    fn ct_eq_matches_only_equal_slices() {
+        assert!(ct_eq(b"bob", b"bob"));
+        assert!(!ct_eq(b"bob", b"boc"));
+        assert!(!ct_eq(b"bob", b"bobby"));
+        assert!(ct_eq(b"", b""));
     }
 
     #[test]

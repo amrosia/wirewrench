@@ -173,7 +173,9 @@ ww targ cancel 1
 
 Reach hosts that only the **target** can reach.  Both commands dial *from*
 the `ww-target` agent; the only new listener is a local one on your machine
-(default loopback).  Requires `ww-target` **≥ 3.3.0**.
+(default loopback).  Requires a `ww-target` that advertises the `tunnel`
+feature — that is **v3.4.0 or later** (the tunneling work was developed as
+"3.3.0", but no 3.3.0 release was ever published).
 
 ```bash
 # Forward one local port: [bind:]lport:host:port (default bind 127.0.0.1)
@@ -202,9 +204,18 @@ curl -x http://127.0.0.1:1080 --proxytunnel https://internal.corp/
   Use `--local-dns` to resolve in `ww` instead.
 - **Bind is loopback by default**; binding anywhere else prints a loud warning —
   there is no destination ACL in v1, so the loopback bind is the real control.
+- **SOCKS5 auth covers SOCKS5 only.**  HTTP CONNECT has no credential support, so
+  it is answered with `501` whenever `--socks-user/--socks-pass` are set (use
+  `--socks-only` to say so explicitly).  `--socks-pass` can also be supplied as
+  `WW_SOCKS_PASS`, which keeps it out of `ps` output and shell history.
 - **Limits**: 64 simultaneous streams per session (agent *and* server), 600 s
-  idle reaping (`ww-target --max-streams`, `--idle-timeout`), and the target
-  always refuses to dial the agent's own server.
+  idle reaping (`ww-target --max-streams`, `--idle-timeout`), 128 concurrent
+  local connections per listener, and a best-effort refusal to dial the agent's
+  own server (the literal host, plus any address the target would resolve it to).
+- **Stalled streams**: the link is multiplexed, so a destination that stops
+  reading cannot be given TCP backpressure per stream.  A stream whose per-stream
+  write queue fills up is reset with the reason `stream stalled` rather than
+  blocking (or silently dropping) every other stream.
 - **Session lifetime**: listeners are bound to the session id they were started
   with.  If the target reconnects it gets a *new* id; restart the listener with
   that id (or use `--exit-on-disconnect`).  New connections during the gap are

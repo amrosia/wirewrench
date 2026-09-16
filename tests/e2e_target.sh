@@ -22,10 +22,12 @@
 #  18. WW_NO_TUNNEL refuses tunneling without hanging
 #  19. Half-close propagation and --max-streams
 #  20. Idle SOCKS client is dropped by the handshake timeout
+#  21. SOCKS5 auth is enforced; HTTP CONNECT is refused when auth is on
+#  22. A destination that speaks first is relayed reliably (OPENED/DATA order)
 #
 # Usage: ./tests/e2e_target.sh
 # Requires: ww, ww-server, ww-target on PATH (ssh-keygen for tests 11-12,
-#           python3 for tests 13-20)
+#           python3 for tests 13-22)
 
 set -euo pipefail
 
@@ -428,14 +430,16 @@ tunnel_cleanup() {
     for p in ${FWD1:-} ${FWD2:-} ${SOCK1:-} ${SOCK2:-} ${SOCK3:-} ${MAX_SOCK:-} \
              ${HALF_FWD:-} ${NOTUN_FWD:-} ${BG:-} ${TUN_SRV:-} ${TUN_TGT:-} \
              ${HTTP_PID:-} ${HOLD_PID:-} ${HALF_PID:-} ${MAX_SRV:-} ${MAX_TGT:-} \
-             ${MAX_HOLD:-} ${NOTUN_SRV:-} ${NOTUN_TGT:-} ${TUNNEL_CLIENT:-}; do
+             ${MAX_HOLD:-} ${NOTUN_SRV:-} ${NOTUN_TGT:-} ${TUNNEL_CLIENT:-} \
+             ${SOCK_AUTH:-} ${BANNER_PID:-} ${SOCK_BANNER:-}; do
         [ -n "$p" ] && kill "$p" 2>/dev/null || true
     done
     sleep 0.3
     for p in ${FWD1:-} ${FWD2:-} ${SOCK1:-} ${SOCK2:-} ${SOCK3:-} ${MAX_SOCK:-} \
              ${HALF_FWD:-} ${NOTUN_FWD:-} ${BG:-} ${TUN_SRV:-} ${TUN_TGT:-} \
              ${HTTP_PID:-} ${HOLD_PID:-} ${HALF_PID:-} ${MAX_SRV:-} ${MAX_TGT:-} \
-             ${MAX_HOLD:-} ${NOTUN_SRV:-} ${NOTUN_TGT:-} ${TUNNEL_CLIENT:-}; do
+             ${MAX_HOLD:-} ${NOTUN_SRV:-} ${NOTUN_TGT:-} ${TUNNEL_CLIENT:-} \
+             ${SOCK_AUTH:-} ${BANNER_PID:-} ${SOCK_BANNER:-}; do
         [ -n "$p" ] && kill -9 "$p" 2>/dev/null || true
     done
 }
@@ -784,6 +788,128 @@ else
     echo "  Got: $OUT"
 fi
 
+header "21. SOCKS5 auth is enforced; HTTP CONNECT is refused with it"
+ww -s "$TUN_SOCK" socks "$LIVE_ID" --listen 127.0.0.1:18090 \
+   --socks-user bob --socks-pass s3cret >/tmp/ww_test_socks_auth.log 2>&1 &
+SOCK_AUTH=$!
+sleep 1
+AUTH_RAW=$(python3 - <<'PY'
+import socket
+
+def recvn(s, n):
+    b = b''
+    while len(b) < n:
+        c = s.recv(n - len(b))
+        if not c:
+            break
+        b += c
+    return b
+
+def talk(payload, n=10):
+    s = socket.create_connection(('127.0.0.1', 18090), timeout=10)
+    s.sendall(payload)
+    try:
+        return recvn(s, n)
+    finally:
+        s.close()
+
+# Only the no-auth method offered while credentials are configured -> 0xFF.
+print('noauth', talk(b'\x05\x01\x00', 2).hex())
+# User/pass offered with the wrong password -> RFC 1929 failure (01 01).
+print('bad', talk(b'\x05\x01\x02' + b'\x01\x03bob\x05wrong', 4).hex())
+# Correct credentials, then a real CONNECT request -> greet 05 02, auth 01 00, reply 05 00.
+s = socket.create_connection(('127.0.0.1', 18090), timeout=10)
+s.sendall(b'\x05\x01\x02' + b'\x01\x03bob\x06s3cret')
+greet = recvn(s, 2)
+auth = recvn(s, 2)
+s.sendall(b'\x05\x01\x00\x01\x7f\x00\x00\x01\x1f\xa3')  # 127.0.0.1:8099 (the HTTP server)
+try:
+    reply = recvn(s, 10)
+except Exception:
+    reply = b''
+s.close()
+print('ok', (greet + auth + reply).hex())
+# HTTP CONNECT on the authenticated port -> 501 (auth is SOCKS5-only).
+http = talk(b'CONNECT 127.0.0.1:8099 HTTP/1.1\r\n\r\n', 32)
+print('http', http.decode(errors='replace').splitlines()[0] if http else 'closed')
+PY
+)
+if echo "$AUTH_RAW" | grep -q "noauth 05ff"; then
+    pass "client offering only 'no auth' is rejected (0xFF)"
+else
+    fail "auth was bypassable by offering only method 0x00"
+    echo "  $AUTH_RAW"
+fi
+if echo "$AUTH_RAW" | grep -q "bad 05020101"; then
+    pass "wrong password -> RFC 1929 failure"
+else
+    fail "wrong password was not rejected"
+    echo "  $AUTH_RAW"
+fi
+if echo "$AUTH_RAW" | grep -q "ok 0502010005000001000000000000"; then
+    pass "correct credentials tunnel to the destination"
+else
+    fail "authenticated SOCKS5 request failed"
+    echo "  $AUTH_RAW"
+fi
+if echo "$AUTH_RAW" | grep -q "http HTTP/1.1 501"; then
+    pass "HTTP CONNECT refused (501) while SOCKS5 auth is enabled"
+else
+    fail "HTTP CONNECT bypassed SOCKS5 auth"
+    echo "  $AUTH_RAW"
+fi
+kill $SOCK_AUTH 2>/dev/null || true
+
+header "22. a destination that speaks first is relayed reliably"
+python3 - >/tmp/ww_test_banner.log 2>&1 <<'PY' &
+import socket
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(('127.0.0.1', 8094))
+srv.listen(8)
+while True:
+    c, _ = srv.accept()
+    try:
+        c.sendall(b'BANNER-FIRST\n')  # speaks before the client says anything
+        c.settimeout(5)
+        try:
+            c.recv(64)
+        except Exception:
+            pass
+    finally:
+        c.close()
+PY
+BANNER_PID=$!
+sleep 1
+# Bound to the *current* session id (18080 is bound to the pre-restart id).
+ww -s "$TUN_SOCK" socks "$LIVE_ID" --listen 127.0.0.1:18091 >/tmp/ww_test_banner_socks.log 2>&1 &
+SOCK_BANNER=$!
+sleep 1
+BANNER_OK=0
+for _ in 1 2 3 4 5; do
+    OUT=$(python3 - <<'PY'
+import socket
+s = socket.create_connection(('127.0.0.1', 18091), timeout=10)
+s.sendall(b'\x05\x01\x00')
+s.recv(2)
+s.sendall(b'\x05\x01\x00\x03\x09127.0.0.1\x1f\x9e')  # 127.0.0.1:8094
+try:
+    print(s.recv(10).hex())
+    print(s.recv(64).decode(errors='replace').strip())
+except Exception as e:
+    print('err', e)
+PY
+)
+    if echo "$OUT" | grep -q "BANNER-FIRST"; then
+        BANNER_OK=$((BANNER_OK + 1))
+    fi
+done
+if [ "$BANNER_OK" = 5 ]; then
+    pass "5/5 banner-first destinations relayed their banner"
+else
+    fail "banner-first tunnel lost data ($BANNER_OK/5)"
+fi
+kill $BANNER_PID $SOCK_BANNER 2>/dev/null || true
 tunnel_cleanup
 
 # ─────────────────────────────────────────────────────────────────────────────

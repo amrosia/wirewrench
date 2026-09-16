@@ -76,15 +76,43 @@ pub enum TunnelEvent {
     Closed(String),
 }
 
-pub type Tunnels = Arc<Mutex<HashMap<u32, mpsc::Sender<TunnelEvent>>>>;
+/// One tunnel stream: the event channel to its relay plus the reason the
+/// sender was dropped, if it had to be (so the relay can report an accurate
+/// close reason instead of guessing).
+pub struct TunnelEntry {
+    pub tx: mpsc::Sender<TunnelEvent>,
+    pub overflow: Arc<std::sync::Mutex<Option<String>>>,
+}
 
-/// Deliver a tunnel event to its relay, dropping the sender when the relay is
-/// gone or too slow (a full channel resets that stream only).
+impl TunnelEntry {
+    #[must_use]
+    pub fn new(tx: mpsc::Sender<TunnelEvent>, overflow: Arc<std::sync::Mutex<Option<String>>>) -> Self {
+        Self { tx, overflow }
+    }
+}
+
+/// The reason recorded for a dropped entry, if any.
+#[must_use]
+pub fn overflow_reason(overflow: &std::sync::Mutex<Option<String>>) -> Option<String> {
+    overflow.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+}
+
+/// Depth of one stream's event queue (a full queue resets that stream only).
+pub const TUNNEL_EVENT_QUEUE: usize = 64;
+
+pub type Tunnels = Arc<Mutex<HashMap<u32, TunnelEntry>>>;
+
+/// Deliver a tunnel event to its relay.  When the relay is gone or too slow
+/// the sender is dropped — which unblocks it — and the reason is recorded so
+/// the relay reports "consumer too slow" rather than "session closed".
 async fn deliver_tunnel(tunnels: &Tunnels, stream_id: u32, event: TunnelEvent) {
     let mut map = tunnels.lock().await;
-    let Some(tx) = map.get(&stream_id) else { return };
-    if tx.try_send(event).is_err() {
+    let Some(entry) = map.get(&stream_id) else { return };
+    if entry.tx.try_send(event).is_err() {
+        let overflow = Arc::clone(&entry.overflow);
         map.remove(&stream_id);
+        *overflow.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some("consumer too slow".to_string());
     }
 }
 

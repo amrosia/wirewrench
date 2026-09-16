@@ -1,5 +1,7 @@
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use wirewrench::target::protocol::MAX_FRAME_PAYLOAD;
+
 /// Write a framed packet (type + LE32 length + payload) to an async writer.
 pub async fn write_frame<W: AsyncWriteExt + Unpin>(w: &mut W, ftype: u8, payload: &[u8]) -> std::io::Result<()> {
     w.write_all(&[ftype]).await?;
@@ -24,6 +26,13 @@ pub async fn read_frame<R: AsyncReadExt + Unpin>(r: &mut R) -> std::io::Result<(
     r.read_exact(&mut header).await?;
     let ftype = header[0];
     let len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
+    // The length is peer-supplied: refuse to allocate an unbounded buffer.
+    if len > MAX_FRAME_PAYLOAD {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("frame payload of {len} bytes exceeds the {MAX_FRAME_PAYLOAD}-byte limit"),
+        ));
+    }
     let mut payload = vec![0u8; len];
     if len > 0 {
         r.read_exact(&mut payload).await?;

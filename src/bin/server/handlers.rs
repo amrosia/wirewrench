@@ -2,7 +2,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -20,7 +20,10 @@ use wirewrench::{Command, Response};
 
 use super::auth as srv_auth;
 use super::frame;
-use super::session::{CtrlQueue, ManagedSession, SessionManager, TunnelEvent, Tunnels};
+use super::session::{
+    CtrlQueue, ManagedSession, SessionManager, TUNNEL_EVENT_QUEUE, TunnelEntry, TunnelEvent, Tunnels,
+    overflow_reason,
+};
 use super::shells;
 
 // ── Control connection (Unix socket or TCP) ────────────────────────────────
@@ -243,10 +246,9 @@ fn write_json_line(stream: &mut ControlStream, val: &impl serde::Serialize) -> R
 
 /// Read one `\n`-terminated line from a blocking control stream,
 /// **byte-at-a-time**, so no bytes belonging to the *next* message (or to an
-/// early tunnel payload) can be swallowed by a `BufReader`.  Returns the line
-/// without its trailing newline plus any over-read bytes (always empty here,
-/// kept so callers can forward pipelined data).
-fn read_line_raw(stream: &mut ControlStream) -> Result<(Vec<u8>, Vec<u8>)> {
+/// early tunnel payload) can be swallowed by a `BufReader`.  Because it never
+/// over-reads, there is no leftover buffer to hand on.
+fn read_line_raw(stream: &mut ControlStream) -> Result<Vec<u8>> {
     const MAX_LINE: usize = 64 * 1024;
     let mut line = Vec::new();
     let mut byte = [0_u8; 1];
@@ -260,7 +262,7 @@ fn read_line_raw(stream: &mut ControlStream) -> Result<(Vec<u8>, Vec<u8>)> {
         line.push(byte[0]);
         anyhow::ensure!(line.len() <= MAX_LINE, "control line too long");
     }
-    Ok((line, Vec::new()))
+    Ok(line)
 }
 
 /// Run the SSH-style auth handshake on a TCP control connection.  Returns
@@ -285,7 +287,7 @@ fn authenticate(stream: &mut ControlStream, keys_path: &Path) -> Result<bool> {
     let challenge_b64 = wauth::b64_encode(&challenge);
 
     for _ in 0..wauth::MAX_OFFERS {
-        let (line, _) = read_line_raw(stream)?;
+        let line = read_line_raw(stream)?;
         let msg: Value = match serde_json::from_slice(&line) {
             Ok(v) => v,
             Err(_) => {
@@ -314,7 +316,7 @@ fn authenticate(stream: &mut ControlStream, keys_path: &Path) -> Result<bool> {
 
                 let _ = write_json_line(stream, &json!({"type":"auth_challenge","challenge": challenge_b64}));
 
-                let (line, _) = read_line_raw(stream)?;
+                let line = read_line_raw(stream)?;
                 let sig_msg: Value = serde_json::from_slice(&line)?;
                 if sig_msg["type"] != "auth_sign" {
                     let _ = write_json_line(stream, &json!({"status":"error","message":"authentication failed"}));
@@ -382,16 +384,21 @@ async fn handle_control_conn(
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
 
-    if let Some(path) = auth_keys_path
-        && !authenticate(&mut stream, path)?
-    {
-        return Ok(());
+    if let Some(path) = auth_keys_path {
+        // `authenticate` performs blocking std I/O for up to `MAX_OFFERS`
+        // reads; a blocking region keeps it off the async worker threads (it
+        // requires the multi-threaded runtime, see main.rs).
+        if !tokio::task::block_in_place(|| authenticate(&mut stream, path))? {
+            return Ok(());
+        }
     }
 
     // Read the command line.  With no auth configured, tolerate a stray
     // `auth_offer` from a client that has a key, and tell it auth isn't needed.
-    let (line, leftover) = loop {
-        let (line, leftover) = read_line_raw(&mut stream)?;
+    // The read is byte-at-a-time and blocking, so it runs in a blocking region
+    // too — otherwise a peer dribbling bytes could starve the runtime.
+    let line = loop {
+        let line = tokio::task::block_in_place(|| read_line_raw(&mut stream))?;
         if auth_keys_path.is_none()
             && let Ok(v) = serde_json::from_slice::<Value>(&line)
             && v["type"] == "auth_offer"
@@ -399,7 +406,7 @@ async fn handle_control_conn(
             let _ = write_json_line(&mut stream, &json!({"type":"auth_not_required"}));
             continue;
         }
-        break (line, leftover);
+        break line;
     };
 
     let cmd: Command = serde_json::from_slice(&line)?;
@@ -421,7 +428,7 @@ async fn handle_control_conn(
             respond_json(&mut stream, &Response::ok()).await?;
         }
         "interact" => interact_handler(cmd, &manager, &mut stream).await?,
-        "connect" => return connect_handler(cmd, &manager, stream, leftover).await,
+        "connect" => return connect_handler(cmd, &manager, stream).await,
         _ => respond_json(&mut stream, &Response::error(format!("Unknown action: {action}"))).await?,
     }
     Ok(())
@@ -549,22 +556,47 @@ async fn push_handler(
     let Some(transfer) = prepare_smart_transfer(id, manager, stream, Some("Push only supported on smart (ww-target) sessions")).await? else { return Ok(()) };
     let SmartTransfer { writer, ctrl_queue, ift, alive: _ } = transfer;
 
-    // Read file data from the control socket.  Returns `Ok(None)` after an
-    // error response has been sent.
+    // Read file data from the control socket.  The declared size is
+    // peer-supplied, so it is capped before anything is allocated or read.
+    if pc.size > MAX_PUSH_SIZE {
+        ift.store(false, Ordering::SeqCst);
+        respond_error(
+            stream,
+            format!("Push rejected: {} bytes exceeds the {MAX_PUSH_SIZE}-byte limit", pc.size),
+        )
+        .await;
+        return Ok(());
+    }
     let size: usize = pc.size.try_into()?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    let mut data = Vec::with_capacity(size);
-    while data.len() < size {
-        let want = (size - data.len()).min(65536);
-        let mut chunk = vec![0_u8; want];
-        let n = stream.read(&mut chunk)?;
-        if n == 0 {
+    // These are blocking std reads on an async worker thread (and they can take
+    // as long as the uploader needs), so they run in a blocking region.
+    let read_result = tokio::task::block_in_place(|| -> std::io::Result<Option<Vec<u8>>> {
+        let mut data = Vec::with_capacity(size.min(16 * 1024 * 1024));
+        while data.len() < size {
+            let want = (size - data.len()).min(65536);
+            let mut chunk = vec![0_u8; want];
+            let n = stream.read(&mut chunk)?;
+            if n == 0 {
+                return Ok(None);
+            }
+            data.extend_from_slice(&chunk[..n]);
+        }
+        Ok(Some(data))
+    });
+    let data = match read_result {
+        Ok(Some(data)) => data,
+        Ok(None) => {
             ift.store(false, Ordering::SeqCst);
             respond_error(stream, "Connection closed during push").await;
             return Ok(());
         }
-        data.extend_from_slice(&chunk[..n]);
-    }
+        Err(e) => {
+            ift.store(false, Ordering::SeqCst);
+            respond_error(stream, format!("Push read failed: {e}")).await;
+            return Ok(());
+        }
+    };
 
     let srv_hash = {
         let mut h = sha2::Sha256::new();
@@ -753,6 +785,9 @@ async fn targ_cancel_handler(
 
 const MAX_TUNNELS_PER_SESSION: usize = 64;
 
+/// Largest file body the control connection will buffer for a `push`.
+const MAX_PUSH_SIZE: u64 = 512 * 1024 * 1024;
+
 #[derive(serde::Deserialize)]
 pub struct ConnectCommand {
     pub host: String,
@@ -768,7 +803,6 @@ async fn connect_handler(
     cmd: Command,
     manager: &Arc<Mutex<SessionManager>>,
     mut stream: ControlStream,
-    leftover: Vec<u8>,
 ) -> Result<()> {
     let id = cmd.id.unwrap_or(0);
     let cc: ConnectCommand = match serde_json::from_str(&cmd.data.unwrap_or_default()) {
@@ -805,14 +839,22 @@ async fn connect_handler(
         .await;
         return Ok(());
     }
-    if tunnels.lock().await.len() >= MAX_TUNNELS_PER_SESSION {
-        let resp = json!({"status":"error","message":"too many tunnels on this session","errno":24});
-        let _ = respond_json(&mut stream, &resp).await;
-        return Ok(());
-    }
 
-    let (tx, mut rx) = mpsc::channel::<TunnelEvent>(64);
-    tunnels.lock().await.insert(stream_id, tx);
+    let (tx, mut rx) = mpsc::channel::<TunnelEvent>(TUNNEL_EVENT_QUEUE);
+    let overflow: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+    // Check the cap and insert under one lock: two concurrent connects must not
+    // both pass the check.
+    {
+        let mut map = tunnels.lock().await;
+        if map.len() >= MAX_TUNNELS_PER_SESSION {
+            drop(map);
+            let resp =
+                json!({"status":"error","message":"too many tunnels on this session","errno":24});
+            let _ = respond_json(&mut stream, &resp).await;
+            return Ok(());
+        }
+        map.insert(stream_id, TunnelEntry::new(tx, Arc::clone(&overflow)));
+    }
 
     let open = protocol::TunnelOpen {
         stream_id,
@@ -830,23 +872,35 @@ async fn connect_handler(
         }
     }
 
+    // Wait for the open result.  A target is allowed to emit tunnel bytes
+    // before `TUNNEL_OPENED` (a destination that speaks first), so any early
+    // `Data` is buffered and replayed once the stream is confirmed.
     let wait = cc.timeout.clamp(0.1, 3600.0) + 5.0;
-    let opened = match tokio::time::timeout(Duration::from_secs_f64(wait), rx.recv()).await {
-        Ok(Some(TunnelEvent::Opened(opened))) => opened,
-        Ok(Some(_)) => {
-            tunnels.lock().await.remove(&stream_id);
-            respond_error(&mut stream, "unexpected tunnel event").await;
-            return Ok(());
-        }
-        Ok(None) => {
-            tunnels.lock().await.remove(&stream_id);
-            respond_error(&mut stream, "target session closed").await;
-            return Ok(());
-        }
-        Err(_) => {
-            tunnels.lock().await.remove(&stream_id);
-            respond_error(&mut stream, "target did not answer the tunnel request").await;
-            return Ok(());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(wait);
+    let mut leftover: Vec<u8> = Vec::new();
+    let opened = loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let event = tokio::time::timeout(remaining, rx.recv()).await;
+        match event {
+            Ok(Some(TunnelEvent::Opened(opened))) => break opened,
+            Ok(Some(TunnelEvent::Data(bytes))) => leftover.extend_from_slice(&bytes),
+            Ok(Some(TunnelEvent::Eof)) | Ok(Some(TunnelEvent::Closed(_))) => {
+                tunnels.lock().await.remove(&stream_id);
+                respond_error(&mut stream, "tunnel closed before it opened").await;
+                return Ok(());
+            }
+            Ok(None) => {
+                tunnels.lock().await.remove(&stream_id);
+                let reason = overflow_reason(&overflow)
+                    .unwrap_or_else(|| "target session closed".to_string());
+                respond_error(&mut stream, reason).await;
+                return Ok(());
+            }
+            Err(_) => {
+                tunnels.lock().await.remove(&stream_id);
+                respond_error(&mut stream, "target did not answer the tunnel request").await;
+                return Ok(());
+            }
         }
     };
 
@@ -877,7 +931,7 @@ async fn connect_handler(
             return Err(e.into());
         }
     };
-    relay_tunnel(control, writer, rx, leftover, stream_id, tunnels).await;
+    relay_tunnel(control, writer, rx, leftover, stream_id, tunnels, overflow).await;
     Ok(())
 }
 
@@ -890,8 +944,9 @@ async fn relay_tunnel(
     leftover: Vec<u8>,
     stream_id: u32,
     tunnels: Tunnels,
+    overflow: Arc<StdMutex<Option<String>>>,
 ) {
-    let _ = relay_tunnel_inner(control, &writer, &mut rx, leftover, stream_id).await;
+    let _ = relay_tunnel_inner(control, &writer, &mut rx, leftover, stream_id, &overflow).await;
     tunnels.lock().await.remove(&stream_id);
 }
 
@@ -913,6 +968,7 @@ async fn relay_tunnel_inner(
     rx: &mut mpsc::Receiver<TunnelEvent>,
     leftover: Vec<u8>,
     stream_id: u32,
+    overflow: &StdMutex<Option<String>>,
 ) -> Result<()> {
     let mut control_open = true;
 
@@ -984,7 +1040,11 @@ async fn relay_tunnel_inner(
                 return Ok(());
             }
             Act::SessionGone => {
-                write_tunnel_close(writer, stream_id, "session closed").await;
+                // `None` means either the session died or this stream was
+                // dropped for being too slow — say which.
+                let reason = overflow_reason(overflow)
+                    .unwrap_or_else(|| "session closed".to_string());
+                write_tunnel_close(writer, stream_id, &reason).await;
                 return Ok(());
             }
         }

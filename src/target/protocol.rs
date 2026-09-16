@@ -44,6 +44,11 @@ pub const FEATURE_TUNNEL: &str = "tunnel";
 /// Maximum number of bytes carried in a single `FRAME_TUNNEL_DATA` payload.
 pub const MAX_TUNNEL_DATA: usize = 32 * 1024;
 
+/// Upper bound on a single frame payload, enforced by both peers before
+/// allocating.  The largest legitimate payload is a 64 KiB file-data chunk
+/// (`FRAME_FILE_DATA`); `MAX_TUNNEL_DATA` is far below this.
+pub const MAX_FRAME_PAYLOAD: usize = 8 * 1024 * 1024;
+
 /// Server → target: request a TCP connection to `host:port` as `stream_id`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TunnelOpen {
@@ -303,6 +308,11 @@ mod tests {
     fn tunnel_stream_id_ignores_trailing_bytes() {
         let payload = tunnel_data_payload(9, b"ignored-trailer");
         assert_eq!(tunnel_stream_id(&payload), Some(9));
+    }
+
+    #[test]
+    fn frame_limits_admit_every_tunnel_frame() {
+        const { assert!(MAX_TUNNEL_DATA + 4 <= MAX_FRAME_PAYLOAD) };
     }
 
     #[test]

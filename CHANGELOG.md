@@ -1,5 +1,49 @@
 # Changelog
 
+## v3.4.1 — security & robustness fixes for tunneling
+
+- **Security: SOCKS5 auth was bypassable.**  With `--socks-user/--socks-pass`
+  set, a client that offered only the *no authentication* method was accepted
+  without credentials; RFC 1928 requires `0xFF` in that case.  Auth is now
+  mandatory whenever it is configured, with unit tests for the method-selection
+  path.
+- **Security: HTTP CONNECT bypassed SOCKS5 auth.**  RFC 1929 credentials are
+  SOCKS5-only, so on the shared port an unauthenticated HTTP CONNECT used to be
+  proxied even with a credential pair configured.  It now answers `501`.
+- Tunnel open ordering is guaranteed.  `ww-target` announces a stream before
+  starting its read half, and the server buffers early tunnel bytes if a peer
+  still sends them before `FRAME_TUNNEL_OPENED`, so a destination that speaks
+  first (SSH/SMTP banners) can no longer make the open fail with
+  "unexpected tunnel event".
+- `ww-target` no longer blocks the entire session on a stalled destination: each
+  stream has its own writer thread with a bounded queue, and a stream whose
+  queue overflows is reset with the reason `stream stalled` instead of freezing
+  every other stream (or silently truncating).
+- The `ww-target` inbound (socket → dispatcher) queue is bounded (256 frames), so
+  a peer can no longer make the agent buffer frames without limit.
+- Server-side close reasons are accurate: a relay dropped for being too slow now
+  reports `consumer too slow` instead of `session closed`.
+- Session teardown on `ww-target` closes every open tunnel, so destination
+  sockets and their threads are no longer leaked for up to `--idle-timeout`.
+- Resource limits: frame payloads are capped at `MAX_FRAME_PAYLOAD` (8 MiB) on
+  both peers, `push` bodies are capped at 512 MiB (the peer-declared size used
+  to drive an unchecked `Vec::with_capacity`), and `ww-target` runs at most 8
+  concurrent `FRAME_CMD` processes with 1 MiB of captured output per stream.
+- `ww forward`/`ww socks` cap concurrent local connections at 128, and the
+  server's per-session tunnel cap is now check-and-insert under a single lock.
+- `ww socks`: credentials are compared in constant time, a non-zero `RSV` byte or
+  an empty `ATYP 0x03` name is rejected, HTTP request headers are bounded, and
+  the whole handshake has a wall-clock deadline so a peer that dribbles bytes
+  cannot hold a thread indefinitely.
+- `ww socks --socks-pass` can be supplied through `WW_SOCKS_PASS`, keeping it out
+  of `ps` output and shell history.
+- Control connections run their blocking reads inside `block_in_place`, so a
+  slow `ww` client cannot starve the async workers (tunnel relays, session
+  readers) on the multi-threaded runtime.
+- Docs: the README no longer claims the target *always* refuses to dial its own
+  server (it is best-effort, and now also covers resolved addresses), and the
+  3.3.0 release notes are corrected (see below).
+
 ## v3.4.0 — `ww socks` (SOCKS5 + HTTP CONNECT)
 
 - **`ww socks <id>`** — a SOCKS5 (RFC 1928/1929) and HTTP CONNECT proxy on a
@@ -15,9 +59,16 @@
     and WinSock errno tables
   - Half-close is propagated, so read-to-EOF-then-reply servers and proxychains
     work
-- Protocol unchanged from v3.3.0, so 3.3.0 agents keep working.
+- Protocol unchanged from the pre-tunneling protocol, so v3.2.0 agents keep
+  working: they do not advertise `tunnel`, and `connect` is refused with an
+  actionable message.
 
-## v3.3.0 — TCP tunneling (`ww forward`)
+## v3.3.0 — TCP tunneling (`ww forward`) — folded into v3.4.0
+
+> No **v3.3.0** release was ever published: this work and `ww socks` shipped
+> together as v3.4.0, and there is no `v3.3.0` git tag.  `ww-target --version`
+> (or a `ww list` session that advertises the `tunnel` feature) is a better
+> compatibility check than a version number.
 
 - **`ww forward <id> -L [bind:]lport:host:port`** — forward a local TCP port to a
   host reachable only by the target.  Tunnels are streams on the existing smart

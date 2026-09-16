@@ -8,7 +8,7 @@ use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::net::ToSocketAddrs;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -101,8 +101,10 @@ enum Commands {
         /// Require SOCKS5 username/password auth (RFC 1929)
         #[arg(long)]
         socks_user: Option<String>,
-        /// SOCKS5 password (use with --socks-user)
-        #[arg(long)]
+        /// SOCKS5 password (use with --socks-user).  Prefer the
+        /// WW_SOCKS_PASS environment variable: a password on the command line
+        /// is visible in `ps` output and shell history.
+        #[arg(long, env = "WW_SOCKS_PASS", hide_env_values = true)]
         socks_pass: Option<String>,
         /// Disable HTTP CONNECT; only speak SOCKS5
         #[arg(long)]
@@ -752,6 +754,40 @@ fn is_loopback_host(host: &str) -> bool {
     host == "localhost" || host == "::1" || host == "[::1]" || host.starts_with("127.")
 }
 
+/// Hard cap on concurrently relayed local connections (one thread each).  The
+/// agent and the server cap tunnels at 64 each, but that cap is only applied
+/// *after* a thread and a control connection exist, so a runaway local client
+/// is bounded here.
+const MAX_LOCAL_CONNS: usize = 128;
+
+/// RAII slot in the local-connection budget.
+struct ConnGuard(Arc<AtomicUsize>);
+
+impl ConnGuard {
+    fn acquire(counter: &Arc<AtomicUsize>) -> Option<Self> {
+        let mut n = counter.load(Ordering::SeqCst);
+        loop {
+            if n >= MAX_LOCAL_CONNS {
+                return None;
+            }
+            match counter.compare_exchange(n, n + 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return Some(Self(Arc::clone(counter))),
+                Err(observed) => n = observed,
+            }
+        }
+    }
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn peer_label(client: &std::net::TcpStream) -> String {
+    client.peer_addr().map_or_else(|_| "?.?".to_string(), |a| a.to_string())
+}
+
 /// Error from `open_stream`, carrying the target errno for SOCKS reply mapping.
 #[derive(Debug)]
 struct OpenStreamError {
@@ -841,12 +877,21 @@ fn cmd_forward(cfg: &ClientConfig, id: u32, listen: &str, timeout: f64) -> Resul
     let listener = std::net::TcpListener::bind((bind.as_str(), lport))
         .with_context(|| format!("cannot bind {bind}:{lport}"))?;
     eprintln!("[+] Forwarding {bind}:{lport} -> {host}:{rport} via session #{id}");
+    let conns = Arc::new(AtomicUsize::new(0));
     loop {
         match listener.accept() {
             Ok((client, _)) => {
+                let Some(guard) = ConnGuard::acquire(&conns) else {
+                    eprintln!(
+                        "[-] forward: refusing {} — {MAX_LOCAL_CONNS} local connections already in flight",
+                        peer_label(&client)
+                    );
+                    continue; // dropping `client` closes the connection
+                };
                 let cfg = cfg.clone();
                 let host = host.clone();
                 std::thread::spawn(move || {
+                    let _guard = guard;
                     match open_stream(&cfg, id, &host, rport, timeout) {
                         Ok(stream) => {
                             let _ = relay_local(client, stream);
@@ -880,6 +925,10 @@ fn cmd_socks(
         (Some(u), Some(p)) => Some((u.to_string(), p.to_string())),
         _ => None,
     };
+    if auth.is_some() && !socks_only {
+        eprintln!("[!] SOCKS5 auth is enabled: HTTP CONNECT on the same port is refused (501)");
+        eprintln!("[!]   pass --socks-only to make that explicit");
+    }
     let (bind, port) = parse_listen_addr(listen)?;
     if !is_loopback_host(&bind) {
         eprintln!("[!] ⚠ WARNING: SOCKS proxy bound to non-loopback address {bind}:{port}");
@@ -892,18 +941,27 @@ fn cmd_socks(
 
     let disconnected = Arc::new(AtomicBool::new(false));
     let hinted = Arc::new(AtomicBool::new(false));
+    let conns = Arc::new(AtomicUsize::new(0));
     loop {
         if exit_on_disconnect && disconnected.load(Ordering::SeqCst) {
             break;
         }
         match listener.accept() {
-            Ok((client, peer)) => {
+            Ok((client, _peer)) => {
                 let _ = client.set_nonblocking(false);
+                let Some(guard) = ConnGuard::acquire(&conns) else {
+                    eprintln!(
+                        "[-] socks: refusing {} — {MAX_LOCAL_CONNS} local connections already in flight",
+                        peer_label(&client)
+                    );
+                    continue; // dropping `client` closes the connection
+                };
                 let cfg = cfg.clone();
                 let auth = auth.clone();
                 let disconnected = Arc::clone(&disconnected);
                 let hinted = Arc::clone(&hinted);
                 std::thread::spawn(move || {
+                    let _guard = guard;
                     handle_socks_client(
                         client,
                         &cfg,
@@ -916,14 +974,15 @@ fn cmd_socks(
                         &hinted,
                     );
                 });
-                let _ = peer;
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(100));
+                // `accept` cannot have a timeout, so poll; 50 ms bounds both
+                // the accept latency and the `--exit-on-disconnect` check.
+                std::thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
                 eprintln!("[-] socks accept error: {e}");
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(Duration::from_millis(50));
             }
         }
     }
@@ -961,6 +1020,12 @@ fn http_code_from_errno(errno: i32) -> (u16, &'static str) {
     }
 }
 
+/// Wall-clock budget for a local client handshake, and the per-read timeout
+/// used while it is running.  The budget bounds a peer that dribbles one byte
+/// at a time; the read timeout bounds a single stuck read.
+const HANDSHAKE_BUDGET: Duration = Duration::from_secs(15);
+const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[allow(clippy::too_many_arguments)]
 fn handle_socks_client(
     mut client: std::net::TcpStream,
@@ -973,7 +1038,8 @@ fn handle_socks_client(
     disconnected: &AtomicBool,
     hinted: &AtomicBool,
 ) {
-    let _ = client.set_read_timeout(Some(Duration::from_secs(10)));
+    let deadline = wirewrench::socks::Deadline::after(HANDSHAKE_BUDGET);
+    let _ = client.set_read_timeout(Some(HANDSHAKE_READ_TIMEOUT));
 
     // Detect the protocol without consuming payload (`peek`, not a BufReader).
     let mut first = [0_u8; 1];
@@ -983,11 +1049,14 @@ fn handle_socks_client(
     }
 
     if wirewrench::socks::detect_proto(first[0]) == wirewrench::socks::Proto::HttpConnect {
-        if socks_only {
+        // RFC 1929 auth is SOCKS5-only, so an unauthenticated HTTP CONNECT
+        // would bypass `--socks-user/--socks-pass` on the shared port.  Refuse
+        // it whenever credentials are configured (fail closed).
+        if socks_only || auth.is_some() {
             wirewrench::socks::write_http_reply(&mut client, 501, "Not Implemented");
             return;
         }
-        let req = match wirewrench::socks::read_http_connect(&mut client) {
+        let req = match wirewrench::socks::read_http_connect(&mut client, deadline) {
             Ok(r) => r,
             Err(wirewrench::socks::Error::NotConnect) => {
                 wirewrench::socks::write_http_reply(&mut client, 501, "Not Implemented");
@@ -1018,11 +1087,11 @@ fn handle_socks_client(
 
     // SOCKS5
     let auth_ref = auth.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
-    match wirewrench::socks::greet(&mut client, auth_ref) {
+    match wirewrench::socks::greet(&mut client, auth_ref, deadline) {
         Ok(true) => {}
         _ => return,
     }
-    let req = match wirewrench::socks::read_request(&mut client) {
+    let req = match wirewrench::socks::read_request(&mut client, deadline) {
         Ok(r) => r,
         Err(wirewrench::socks::Error::Code(code)) => {
             wirewrench::socks::write_reply(&mut client, code);

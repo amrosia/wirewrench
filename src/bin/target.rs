@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::io::{BufRead as _, BufReader, Read, Write};
 use std::net::{IpAddr, Shutdown, TcpStream, ToSocketAddrs};
 use std::process::{ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -34,12 +34,12 @@ use wirewrench::target::protocol::{
     CmdRequest, CmdResult, FEATURE_TUNNEL, FRAME_CANCEL, FRAME_CMD, FRAME_CMD_RESULT,
     FRAME_FILE_CTRL, FRAME_FILE_DATA, FRAME_HANDSHAKE, FRAME_HASH, FRAME_KEEPALIVE, FRAME_SHELL,
     FRAME_TUNNEL_CLOSE, FRAME_TUNNEL_DATA, FRAME_TUNNEL_EOF, FRAME_TUNNEL_OPEN, FRAME_TUNNEL_OPENED,
-    Handshake, MAX_TUNNEL_DATA, PullMeta, PushDone, PushError, PushReady, PushVerified,
-    TunnelClose, TunnelOpen, TunnelOpened, tunnel_data_payload, tunnel_stream_id,
+    Handshake, MAX_FRAME_PAYLOAD, MAX_TUNNEL_DATA, PullMeta, PushDone, PushError, PushReady,
+    PushVerified, TunnelClose, TunnelOpen, TunnelOpened, tunnel_data_payload, tunnel_stream_id,
 };
 
 #[derive(Parser)]
-#[command(name = "ww-target")]
+#[command(name = "ww-target", version, about = "wirewrench smart agent")]
 struct Args {
     host: String,
     #[arg(short = 'p', long, default_value_t = wirewrench::DEFAULT_SMART_PORT)]
@@ -64,6 +64,11 @@ struct Args {
 
 /// One outbound frame: `(frame_type, payload)`.
 type Outbound = (u8, Vec<u8>);
+
+/// Depth of the inbound (socket → dispatcher) queue.  Bounded so a peer cannot
+/// make the agent buffer frames without limit; a full queue blocks the reader
+/// thread, which stops reading the socket and pushes back over TCP.
+const INBOUND_QUEUE: usize = 256;
 
 /// Spawn the single writer thread for a session.  Every producer sends frames
 /// on the returned channel; no other code path may write to the socket.
@@ -231,6 +236,11 @@ fn read_frame(r: &mut impl Read) -> Result<(u8, Vec<u8>)> {
     r.read_exact(&mut header)?;
     let frame_type = header[0];
     let len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
+    // Bound the allocation: `len` is peer-supplied.
+    anyhow::ensure!(
+        len <= MAX_FRAME_PAYLOAD,
+        "frame payload of {len} bytes exceeds the {MAX_FRAME_PAYLOAD}-byte limit"
+    );
     let mut payload = vec![0_u8; len];
     if len > 0 {
         r.read_exact(&mut payload)?;
@@ -341,10 +351,71 @@ impl TunnelShared {
     }
 }
 
-/// The write half of an established tunnel stream plus its shared state.
+/// Commands processed by a tunnel stream's writer thread, which owns the write
+/// half of the destination socket.  Writing from a dedicated thread keeps one
+/// stalled destination from freezing the whole session: the dispatcher only
+/// ever performs a non-blocking `try_send`.
+enum TunnelCmd {
+    Data(Vec<u8>),
+    /// Half-close the destination (propagate the peer's EOF).
+    ShutdownWrite,
+    /// Discard queued data and close both directions.
+    Close,
+}
+
+/// An established tunnel stream: the channel to its writer thread plus the
+/// state shared with its reader thread.
 struct TunnelHandle {
-    dest: TcpStream,
+    tx: SyncSender<TunnelCmd>,
     shared: Arc<TunnelShared>,
+}
+
+/// Per-stream write queue depth (≈2 MiB of buffered tunnel data).  A stream
+/// that exceeds it is reset rather than allowed to block the session: the link
+/// is multiplexed, so per-stream TCP backpressure is not available.
+const TUNNEL_WRITE_QUEUE: usize = 64;
+
+/// Spawn the writer thread for one tunnel stream.  Dropping the returned
+/// sender flushes the queue and then closes the socket; sending [`TunnelCmd::Close`]
+/// discards the queue and closes immediately.
+fn spawn_tunnel_writer(mut dest: TcpStream, shared: Arc<TunnelShared>) -> SyncSender<TunnelCmd> {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<TunnelCmd>(TUNNEL_WRITE_QUEUE);
+    thread::spawn(move || {
+        while let Ok(cmd) = rx.recv() {
+            match cmd {
+                TunnelCmd::Data(bytes) => {
+                    if shared.closed_write.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    match dest.write_all(&bytes) {
+                        Ok(()) => shared.touch(),
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                || e.kind() == std::io::ErrorKind::TimedOut =>
+                        {
+                            // A partially written payload cannot be resumed
+                            // safely, so this stream is reset.
+                            shared.set_closing("write timeout");
+                            break;
+                        }
+                        Err(_) => {
+                            shared.set_closing("write failed");
+                            break;
+                        }
+                    }
+                }
+                TunnelCmd::ShutdownWrite => {
+                    if !shared.closed_write.swap(true, Ordering::SeqCst) {
+                        let _ = dest.shutdown(Shutdown::Write);
+                        shared.touch();
+                    }
+                }
+                TunnelCmd::Close => break,
+            }
+        }
+        let _ = dest.shutdown(Shutdown::Both);
+    });
+    tx
 }
 
 // ── Transfer state machine (P1.3) ───────────────────────────────────────────
@@ -366,6 +437,10 @@ enum Transfer {
 
 const PULL_CHUNK: usize = 8192;
 const EMFILE_ERRNO: i32 = 24;
+/// Per-session cap on concurrently executing `FRAME_CMD` threads.
+const MAX_CONCURRENT_CMDS: usize = 8;
+/// Per-stream cap on captured command output (stdout and stderr separately).
+const MAX_CMD_OUTPUT: usize = 1024 * 1024;
 
 // ── Session state ───────────────────────────────────────────────────────────
 
@@ -383,6 +458,7 @@ struct SessionState {
     shell: Arc<Shell>,
     transfer: Transfer,
     streams: HashMap<u32, TunnelHandle>,
+    cmd_inflight: Arc<AtomicUsize>,
     opts: RunOpts,
 }
 
@@ -394,6 +470,7 @@ impl SessionState {
             shell,
             transfer: Transfer::Idle,
             streams: HashMap::new(),
+            cmd_inflight: Arc::new(AtomicUsize::new(0)),
             opts,
         }
     }
@@ -416,30 +493,50 @@ impl SessionState {
             let Some(handle) = self.streams.remove(&id) else {
                 continue;
             };
-            if handle.shared.remote_closed.load(Ordering::SeqCst) {
+            // Dropping the sender makes the writer thread flush and then close
+            // the destination socket.
+            let TunnelHandle { tx, shared } = handle;
+            drop(tx);
+            if shared.remote_closed.load(Ordering::SeqCst) {
                 continue;
             }
-            let reason = handle.shared.reason();
+            let reason = shared.reason();
             let close = TunnelClose { stream_id: id, reason };
             if let Ok(json) = serde_json::to_vec(&close) {
                 let _ = self.out.send((FRAME_TUNNEL_CLOSE, json));
             }
-            drop(handle.dest);
+        }
+    }
+
+    /// Tear down every open tunnel on session end.  Closing the destination
+    /// sockets unblocks both per-stream threads, so nothing is left holding a
+    /// fd or a clone of the outbound channel.
+    fn shutdown_streams(&mut self) {
+        for (_, handle) in self.streams.drain() {
+            handle.shared.set_closing("session ended");
+            let _ = handle.tx.try_send(TunnelCmd::Close);
         }
     }
 
     /// Best-effort check that a requested destination is not our own server.
+    /// Compares the literal host, and every address the target would dial
+    /// against the address of the control connection.
     fn is_own_server(&self, host: &str, port: u16) -> bool {
         if port != self.opts.server_port {
             return false;
         }
-        if host == self.opts.server_host {
+        if host.eq_ignore_ascii_case(&self.opts.server_host) {
             return true;
         }
         if let (Ok(ip), Some(peer)) = (host.parse::<IpAddr>(), self.opts.server_ip) {
             return ip == peer;
         }
         false
+    }
+
+    /// Whether dialling `addr` would reach the agent's own server.
+    fn addr_is_own_server(&self, addr: &std::net::SocketAddr, port: u16) -> bool {
+        port == self.opts.server_port && Some(addr.ip()) == self.opts.server_ip
     }
 }
 
@@ -454,7 +551,7 @@ fn run_session(stream: TcpStream, shell: Arc<Shell>, opts: RunOpts) -> Result<()
     let hostname = detect_hostname();
     let platform = Some(format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH));
     let mut features = Vec::new();
-    // Test-only escape hatch: pretend we cannot tunnel (e2e case 20).
+    // Test-only escape hatch: pretend we cannot tunnel (e2e case 18).
     if std::env::var_os("WW_NO_TUNNEL").is_none() {
         features.push(FEATURE_TUNNEL.to_string());
     }
@@ -485,8 +582,8 @@ fn run_session(stream: TcpStream, shell: Arc<Shell>, opts: RunOpts) -> Result<()
     spawn_pipe_to_frames(child_stdout, out.clone());
     spawn_pipe_to_frames(child_stderr, out.clone());
 
-    // ── Reader thread: socket → unbounded channel ────────────────
-    let (frame_tx, frame_rx) = std::sync::mpsc::channel::<(u8, Vec<u8>)>();
+    // ── Reader thread: socket → bounded channel (backpressure) ───
+    let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<(u8, Vec<u8>)>(INBOUND_QUEUE);
     thread::spawn(move || {
         let mut r = reader;
         while let Ok(frame) = read_frame(&mut r) {
@@ -520,8 +617,9 @@ fn run_session(stream: TcpStream, shell: Arc<Shell>, opts: RunOpts) -> Result<()
         }
     }
 
-    // Clean up
+    // Clean up: close every tunnel before the session goes away.
     let _ = st.shell_stdin.flush();
+    st.shutdown_streams();
     let _ = child.kill();
     let _ = child.wait();
     Ok(())
@@ -793,6 +891,15 @@ fn pull_pump(st: &mut SessionState) -> Result<bool> {
 
 // ── Command execution ───────────────────────────────────────────────────────
 
+/// Releases one slot of the per-session command limit when dropped.
+struct CmdSlot(Arc<AtomicUsize>);
+
+impl Drop for CmdSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 fn handle_cmd(st: &mut SessionState, payload: &[u8]) -> Result<()> {
     let req: CmdRequest = match serde_json::from_slice(payload) {
         Ok(r) => r,
@@ -801,34 +908,104 @@ fn handle_cmd(st: &mut SessionState, payload: &[u8]) -> Result<()> {
             return Ok(());
         }
     };
+    // Bound concurrency: each command costs a thread and a process.
+    if st.cmd_inflight.load(Ordering::SeqCst) >= MAX_CONCURRENT_CMDS {
+        let result = CmdResult {
+            seq: req.seq,
+            exit_code: -1,
+            stdout: String::new(),
+            stderr: format!(
+                "refusing to run: {MAX_CONCURRENT_CMDS} commands are already in flight"
+            ),
+        };
+        return send_json(&st.out, FRAME_CMD_RESULT, &result);
+    }
+    st.cmd_inflight.fetch_add(1, Ordering::SeqCst);
+
     // Run in a thread so long-running commands don't stall tunnel traffic.
+    let slot = CmdSlot(Arc::clone(&st.cmd_inflight));
     let out = st.out.clone();
     let shell = Arc::clone(&st.shell);
     thread::spawn(move || {
-        let result = match shell.spawn_cmd(&req.cmd) {
-            Ok(c) => {
-                let output = c.wait_with_output().unwrap_or_else(|_| std::process::Output {
-                    status: std::process::ExitStatus::default(),
-                    stdout: Vec::new(),
-                    stderr: Vec::new(),
-                });
-                CmdResult {
-                    seq: req.seq,
-                    exit_code: output.status.code().unwrap_or(-1),
-                    stdout: normalize_crlf(String::from_utf8_lossy(&output.stdout).into_owned()),
-                    stderr: normalize_crlf(String::from_utf8_lossy(&output.stderr).into_owned()),
-                }
-            }
-            Err(e) => CmdResult {
+        let _slot = slot;
+        let result = run_cmd(&shell, &req);
+        let _ = send_json(&out, FRAME_CMD_RESULT, &result);
+    });
+    Ok(())
+}
+
+/// Run one `FRAME_CMD` with capped stdout/stderr capture.
+fn run_cmd(shell: &Shell, req: &CmdRequest) -> CmdResult {
+    let mut child = match shell.spawn_cmd(&req.cmd) {
+        Ok(c) => c,
+        Err(e) => {
+            return CmdResult {
                 seq: req.seq,
                 exit_code: -1,
                 stdout: String::new(),
                 stderr: format!("Failed to spawn command shell: {e}"),
-            },
-        };
-        let _ = send_json(&out, FRAME_CMD_RESULT, &result);
-    });
-    Ok(())
+            };
+        }
+    };
+
+    // Drain both pipes concurrently — a full pipe would block the child — but
+    // keep at most `MAX_CMD_OUTPUT` bytes per stream.
+    let out_reader = child
+        .stdout
+        .take()
+        .map(|s| thread::spawn(move || read_capped(s, MAX_CMD_OUTPUT)));
+    let err_reader = child
+        .stderr
+        .take()
+        .map(|s| thread::spawn(move || read_capped(s, MAX_CMD_OUTPUT)));
+    let status = child.wait();
+    let (stdout, out_truncated) = out_reader
+        .map(|h| h.join().unwrap_or((Vec::new(), true)))
+        .unwrap_or((Vec::new(), false));
+    let (stderr, err_truncated) = err_reader
+        .map(|h| h.join().unwrap_or((Vec::new(), true)))
+        .unwrap_or((Vec::new(), false));
+
+    let mut stdout = normalize_crlf(String::from_utf8_lossy(&stdout).into_owned());
+    let mut stderr = normalize_crlf(String::from_utf8_lossy(&stderr).into_owned());
+    if out_truncated {
+        stdout.push_str("\n[output truncated]");
+    }
+    if err_truncated {
+        stderr.push_str("\n[output truncated]");
+    }
+
+    CmdResult {
+        seq: req.seq,
+        exit_code: status.ok().and_then(|s| s.code()).unwrap_or(-1),
+        stdout,
+        stderr,
+    }
+}
+
+/// Read the whole stream, keeping at most `cap` bytes.  The stream is always
+/// drained to EOF so the writer (often a child process) never blocks, and the
+/// second element reports whether anything was dropped.
+fn read_capped<R: Read>(mut r: R, cap: usize) -> (Vec<u8>, bool) {
+    let mut out = Vec::new();
+    let mut truncated = false;
+    let mut buf = [0_u8; 8192];
+    loop {
+        match r.read(&mut buf) {
+            Ok(0) | Err(_) => return (out, truncated),
+            Ok(n) => {
+                let room = cap.saturating_sub(out.len());
+                if room == 0 {
+                    truncated = true;
+                } else if n <= room {
+                    out.extend_from_slice(&buf[..n]);
+                } else {
+                    out.extend_from_slice(&buf[..room]);
+                    truncated = true;
+                }
+            }
+        }
+    }
 }
 
 // ── Tunnel handling ─────────────────────────────────────────────────────────
@@ -871,7 +1048,14 @@ fn tunnel_open(st: &mut SessionState, open: TunnelOpen) -> Result<()> {
 
     let mut last_err: Option<std::io::Error> = None;
     let mut dest: Option<TcpStream> = None;
+    let mut skipped_own_server = false;
     for addr in addrs {
+        // The resolved-address check catches aliases and `localhost` that the
+        // literal host comparison above misses.
+        if st.addr_is_own_server(&addr, open.port) {
+            skipped_own_server = true;
+            continue;
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break;
@@ -886,6 +1070,9 @@ fn tunnel_open(st: &mut SessionState, open: TunnelOpen) -> Result<()> {
     }
 
     if dest.is_none() {
+        if skipped_own_server && last_err.is_none() {
+            return fail(st, None, "refusing to dial own server");
+        }
         let e = last_err.unwrap_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout")
         });
@@ -908,20 +1095,20 @@ fn tunnel_open(st: &mut SessionState, open: TunnelOpen) -> Result<()> {
     };
 
     let shared = Arc::new(TunnelShared::new());
-    spawn_tunnel_reader(
-        stream_id,
-        read_dest,
-        st.out.clone(),
-        Arc::clone(&shared),
-        st.opts.idle_timeout,
-    );
-    st.streams.insert(stream_id, TunnelHandle { dest, shared });
-
+    // The writer thread owns the socket's write half; the reader thread gets a
+    // clone.  Announce the stream *before* the reader can enqueue any
+    // TUNNEL_DATA frame: both producers share one FIFO queue and the server
+    // requires TUNNEL_OPENED to be the first event of a stream (otherwise a
+    // destination that speaks first would race it and reset the tunnel).
+    let tx = spawn_tunnel_writer(dest, Arc::clone(&shared));
+    st.streams.insert(stream_id, TunnelHandle { tx, shared: Arc::clone(&shared) });
     send_json(
         &st.out,
         FRAME_TUNNEL_OPENED,
         &TunnelOpened { stream_id, ok: true, bound, errno: None, message: None },
-    )
+    )?;
+    spawn_tunnel_reader(stream_id, read_dest, st.out.clone(), shared, st.opts.idle_timeout);
+    Ok(())
 }
 
 fn spawn_tunnel_reader(
@@ -976,9 +1163,15 @@ fn tunnel_write(st: &mut SessionState, stream_id: u32, bytes: &[u8]) {
     if handle.shared.closed_write.load(Ordering::SeqCst) {
         return;
     }
-    match handle.dest.write_all(bytes) {
-        Ok(()) => handle.shared.touch(),
-        Err(_) => handle.shared.set_closing("write failed"),
+    match handle.tx.try_send(TunnelCmd::Data(bytes.to_vec())) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            // The destination cannot keep up.  The link is multiplexed, so
+            // per-stream TCP backpressure is unavailable: reset this stream
+            // (with a reason) rather than stalling every other stream.
+            handle.shared.set_closing("stream stalled");
+        }
+        Err(TrySendError::Disconnected(_)) => handle.shared.set_closing("writer gone"),
     }
 }
 
@@ -986,11 +1179,14 @@ fn tunnel_shutdown_write(st: &mut SessionState, stream_id: u32) {
     let Some(handle) = st.streams.get_mut(&stream_id) else {
         return;
     };
-    if handle.shared.closed_write.swap(true, Ordering::SeqCst) {
+    if handle.shared.closed_write.load(Ordering::SeqCst) {
         return;
     }
-    let _ = handle.dest.shutdown(Shutdown::Write);
-    handle.shared.touch();
+    match handle.tx.try_send(TunnelCmd::ShutdownWrite) {
+        Ok(()) => handle.shared.touch(),
+        Err(TrySendError::Full(_)) => handle.shared.set_closing("stream stalled"),
+        Err(TrySendError::Disconnected(_)) => handle.shared.set_closing("writer gone"),
+    }
 }
 
 fn tunnel_remote_close(st: &mut SessionState, stream_id: u32) {
@@ -998,7 +1194,9 @@ fn tunnel_remote_close(st: &mut SessionState, stream_id: u32) {
         return;
     };
     handle.shared.remote_closed.store(true, Ordering::SeqCst);
-    let _ = handle.dest.shutdown(Shutdown::Both);
+    // `Close` discards queued data and shuts the socket down.  If the queue is
+    // full the reaper closes the stream on its next tick anyway.
+    let _ = handle.tx.try_send(TunnelCmd::Close);
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────

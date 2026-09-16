@@ -106,6 +106,8 @@ async fn control_tcp_server(
 
 // ── Main ────────────────────────────────────────────────────────────────────
 
+// Multi-threaded on purpose: control connections wrap their blocking std reads
+// in `tokio::task::block_in_place`, which panics on a `current_thread` runtime.
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
