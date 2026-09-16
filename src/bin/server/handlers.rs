@@ -1,5 +1,6 @@
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,8 +11,8 @@ use serde_json::{json, Value};
 use sha2::Digest;
 use ssh_key::public::PublicKey;
 use ssh_key::HashAlg;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{Mutex, mpsc};
 
 use wirewrench::auth as wauth;
 use wirewrench::target::protocol;
@@ -19,7 +20,7 @@ use wirewrench::{Command, Response};
 
 use super::auth as srv_auth;
 use super::frame;
-use super::session::{CtrlQueue, ManagedSession, SessionManager};
+use super::session::{CtrlQueue, ManagedSession, SessionManager, TunnelEvent, Tunnels};
 use super::shells;
 
 // ── Control connection (Unix socket or TCP) ────────────────────────────────
@@ -75,6 +76,66 @@ impl ControlStream {
         match self {
             ControlStream::Unix(s) => s.set_nonblocking(nb),
             ControlStream::Tcp(s) => s.set_nonblocking(nb),
+        }
+    }
+
+    /// Convert a blocking control stream into a tokio async stream (used by
+    /// the tunnel relay).
+    pub fn into_async(self) -> std::io::Result<AsyncControl> {
+        self.set_nonblocking(true)?;
+        Ok(match self {
+            ControlStream::Unix(s) => AsyncControl::Unix(tokio::net::UnixStream::from_std(s)?),
+            ControlStream::Tcp(s) => AsyncControl::Tcp(tokio::net::TcpStream::from_std(s)?),
+        })
+    }
+}
+
+/// An async-wrapped control connection.
+pub enum AsyncControl {
+    Unix(tokio::net::UnixStream),
+    Tcp(tokio::net::TcpStream),
+}
+
+impl tokio::io::AsyncRead for AsyncControl {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            AsyncControl::Unix(s) => Pin::new(s).poll_read(cx, buf),
+            AsyncControl::Tcp(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for AsyncControl {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            AsyncControl::Unix(s) => Pin::new(s).poll_write(cx, buf),
+            AsyncControl::Tcp(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            AsyncControl::Unix(s) => Pin::new(s).poll_flush(cx),
+            AsyncControl::Tcp(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            AsyncControl::Unix(s) => Pin::new(s).poll_shutdown(cx),
+            AsyncControl::Tcp(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
 }
@@ -180,43 +241,55 @@ fn write_json_line(stream: &mut ControlStream, val: &impl serde::Serialize) -> R
     Ok(())
 }
 
+/// Read one `\n`-terminated line from a blocking control stream,
+/// **byte-at-a-time**, so no bytes belonging to the *next* message (or to an
+/// early tunnel payload) can be swallowed by a `BufReader`.  Returns the line
+/// without its trailing newline plus any over-read bytes (always empty here,
+/// kept so callers can forward pipelined data).
+fn read_line_raw(stream: &mut ControlStream) -> Result<(Vec<u8>, Vec<u8>)> {
+    const MAX_LINE: usize = 64 * 1024;
+    let mut line = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        if stream.read(&mut byte)? == 0 {
+            anyhow::bail!("control connection closed");
+        }
+        if byte[0] == b'\n' {
+            break;
+        }
+        line.push(byte[0]);
+        anyhow::ensure!(line.len() <= MAX_LINE, "control line too long");
+    }
+    Ok((line, Vec::new()))
+}
+
 /// Run the SSH-style auth handshake on a TCP control connection.  Returns
 /// `true` if the client authenticated, `false` if the connection should be
 /// closed (a failure response has already been sent).
-fn authenticate(
-    reader: &mut BufReader<&mut ControlStream>,
-    writer: &mut ControlStream,
-    keys_path: &Path,
-) -> Result<bool> {
+fn authenticate(stream: &mut ControlStream, keys_path: &Path) -> Result<bool> {
     // Per-connection key load (fail closed): rotation applies immediately.
     let keys = match srv_auth::load_authorized_keys(keys_path) {
         Ok(k) => k,
         Err(e) => {
             eprintln!("[!] Control-port auth keys unavailable, rejecting connection: {e}");
-            let _ = write_json_line(writer, &json!({"status":"error","message":"authentication unavailable"}));
+            let _ = write_json_line(stream, &json!({"status":"error","message":"authentication unavailable"}));
             return Ok(false);
         }
     };
 
     // Relax the read timeout for the auth phase.
-    reader.get_mut().set_read_timeout(Some(Duration::from_secs(15)))?;
+    stream.set_read_timeout(Some(Duration::from_secs(15)))?;
 
     let mut challenge = [0u8; wauth::CHALLENGE_LEN];
     rand::rng().fill_bytes(&mut challenge);
     let challenge_b64 = wauth::b64_encode(&challenge);
 
-    let mut line = String::new();
-
     for _ in 0..wauth::MAX_OFFERS {
-        line.clear();
-        let n = reader.read_line(&mut line)?;
-        if n == 0 {
-            return Ok(false);
-        }
-        let msg: Value = match serde_json::from_str(line.trim()) {
+        let (line, _) = read_line_raw(stream)?;
+        let msg: Value = match serde_json::from_slice(&line) {
             Ok(v) => v,
             Err(_) => {
-                let _ = write_json_line(writer, &json!({"status":"error","message":"authentication required"}));
+                let _ = write_json_line(stream, &json!({"status":"error","message":"authentication required"}));
                 return Ok(false);
             }
         };
@@ -224,35 +297,31 @@ fn authenticate(
         match msg["type"].as_str() {
             Some("auth_offer") => {
                 let Some(key_str) = msg["key"].as_str() else {
-                    let _ = write_json_line(writer, &json!({"type":"auth_reject"}));
+                    let _ = write_json_line(stream, &json!({"type":"auth_reject"}));
                     continue;
                 };
                 let offered = match PublicKey::from_openssh(key_str) {
                     Ok(p) => p,
                     Err(_) => {
-                        let _ = write_json_line(writer, &json!({"type":"auth_reject"}));
+                        let _ = write_json_line(stream, &json!({"type":"auth_reject"}));
                         continue;
                     }
                 };
                 let Some(authorized) = keys.iter().find(|k| *k == &offered) else {
-                    let _ = write_json_line(writer, &json!({"type":"auth_reject"}));
+                    let _ = write_json_line(stream, &json!({"type":"auth_reject"}));
                     continue;
                 };
 
-                let _ = write_json_line(writer, &json!({"type":"auth_challenge","challenge": challenge_b64}));
+                let _ = write_json_line(stream, &json!({"type":"auth_challenge","challenge": challenge_b64}));
 
-                line.clear();
-                let n = reader.read_line(&mut line)?;
-                if n == 0 {
-                    return Ok(false);
-                }
-                let sig_msg: Value = serde_json::from_str(line.trim())?;
+                let (line, _) = read_line_raw(stream)?;
+                let sig_msg: Value = serde_json::from_slice(&line)?;
                 if sig_msg["type"] != "auth_sign" {
-                    let _ = write_json_line(writer, &json!({"status":"error","message":"authentication failed"}));
+                    let _ = write_json_line(stream, &json!({"status":"error","message":"authentication failed"}));
                     return Ok(false);
                 }
                 let Some(sig_b64) = sig_msg["signature"].as_str() else {
-                    let _ = write_json_line(writer, &json!({"status":"error","message":"authentication failed"}));
+                    let _ = write_json_line(stream, &json!({"status":"error","message":"authentication failed"}));
                     return Ok(false);
                 };
 
@@ -261,24 +330,24 @@ fn authenticate(
 
                 if srv_auth::verify_signature(authorized, &payload, sig_b64) {
                     eprintln!("[+] Control-port auth ok: {} (TCP)", authorized.fingerprint(HashAlg::Sha256));
-                    let _ = write_json_line(writer, &json!({"status":"ok"}));
-                    reader.get_mut().set_read_timeout(Some(Duration::from_secs(5)))?;
+                    let _ = write_json_line(stream, &json!({"status":"ok"}));
+                    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
                     return Ok(true);
                 }
 
                 eprintln!("[-] Control-port auth failed: bad signature (TCP)");
-                let _ = write_json_line(writer, &json!({"status":"error","message":"authentication failed"}));
+                let _ = write_json_line(stream, &json!({"status":"error","message":"authentication failed"}));
                 return Ok(false);
             }
             _ => {
                 // Not an auth message (e.g. an old client sending a command).
-                let _ = write_json_line(writer, &json!({"status":"error","message":"authentication required"}));
+                let _ = write_json_line(stream, &json!({"status":"error","message":"authentication required"}));
                 return Ok(false);
             }
         }
     }
 
-    let _ = write_json_line(writer, &json!({"status":"error","message":"too many authentication attempts"}));
+    let _ = write_json_line(stream, &json!({"status":"error","message":"too many authentication attempts"}));
     Ok(false)
 }
 
@@ -313,38 +382,28 @@ async fn handle_control_conn(
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
 
-    let mut writer = stream.try_clone()?;
-    let mut buf_reader = BufReader::new(&mut stream);
-
     if let Some(path) = auth_keys_path
-        && !authenticate(&mut buf_reader, &mut writer, path)?
+        && !authenticate(&mut stream, path)?
     {
         return Ok(());
     }
 
     // Read the command line.  With no auth configured, tolerate a stray
     // `auth_offer` from a client that has a key, and tell it auth isn't needed.
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let n = buf_reader.read_line(&mut line)?;
-        if n == 0 {
-            return Ok(());
-        }
+    let (line, leftover) = loop {
+        let (line, leftover) = read_line_raw(&mut stream)?;
         if auth_keys_path.is_none()
-            && let Ok(v) = serde_json::from_str::<Value>(line.trim())
+            && let Ok(v) = serde_json::from_slice::<Value>(&line)
             && v["type"] == "auth_offer"
         {
-            let _ = write_json_line(&mut writer, &json!({"type":"auth_not_required"}));
+            let _ = write_json_line(&mut stream, &json!({"type":"auth_not_required"}));
             continue;
         }
-        break;
-    }
+        break (line, leftover);
+    };
 
-    let cmd: Command = serde_json::from_str(line.trim())?;
-    let action = &cmd.action;
-    let push_buffered = buf_reader.buffer().to_vec();
-    drop(buf_reader);
+    let cmd: Command = serde_json::from_slice(&line)?;
+    let action = cmd.action.clone();
 
     match action.as_str() {
         "list" => {
@@ -353,7 +412,7 @@ async fn handle_control_conn(
         }
         "send" => send_handler(cmd, &manager, &mut stream).await?,
         "read" => read_handler(cmd, &manager, &mut stream).await?,
-        "push" => push_handler(cmd, &manager, &mut stream, push_buffered).await?,
+        "push" => push_handler(cmd, &manager, &mut stream).await?,
         "pull" => pull_handler(cmd, &manager, &mut stream).await?,
         "targ_cancel" => targ_cancel_handler(cmd, &manager).await?,
         "close" => {
@@ -362,6 +421,7 @@ async fn handle_control_conn(
             respond_json(&mut stream, &Response::ok()).await?;
         }
         "interact" => interact_handler(cmd, &manager, &mut stream).await?,
+        "connect" => return connect_handler(cmd, &manager, stream, leftover).await,
         _ => respond_json(&mut stream, &Response::error(format!("Unknown action: {action}"))).await?,
     }
     Ok(())
@@ -476,7 +536,6 @@ async fn push_handler(
     cmd: Command,
     manager: &Arc<Mutex<SessionManager>>,
     stream: &mut ControlStream,
-    buffered: Vec<u8>,
 ) -> Result<()> {
     let id = cmd.id.unwrap_or(0);
     let pc: PushCommand = match serde_json::from_str(&cmd.data.unwrap_or_default()) {
@@ -490,21 +549,21 @@ async fn push_handler(
     let Some(transfer) = prepare_smart_transfer(id, manager, stream, Some("Push only supported on smart (ww-target) sessions")).await? else { return Ok(()) };
     let SmartTransfer { writer, ctrl_queue, ift, alive: _ } = transfer;
 
-    // Read file data from control socket
+    // Read file data from the control socket.  Returns `Ok(None)` after an
+    // error response has been sent.
     let size: usize = pc.size.try_into()?;
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     let mut data = Vec::with_capacity(size);
-    let fb = buffered.len().min(size);
-    if fb > 0 {
-        data.extend_from_slice(&buffered[..fb]);
-    }
-    if size > fb {
-        let mut raw = stream
-            .try_clone()
-            .map_err(|e| anyhow::anyhow!("clone: {e}"))?;
-        raw.set_read_timeout(Some(Duration::from_secs(30)))?;
-        let mut rest = vec![0u8; size - fb];
-        raw.read_exact(&mut rest)?;
-        data.extend_from_slice(&rest);
+    while data.len() < size {
+        let want = (size - data.len()).min(65536);
+        let mut chunk = vec![0_u8; want];
+        let n = stream.read(&mut chunk)?;
+        if n == 0 {
+            ift.store(false, Ordering::SeqCst);
+            respond_error(stream, "Connection closed during push").await;
+            return Ok(());
+        }
+        data.extend_from_slice(&chunk[..n]);
     }
 
     let srv_hash = {
@@ -687,6 +746,268 @@ async fn targ_cancel_handler(
         let mut w = writer.lock().await;
         let _ = frame::write_frame(&mut *w, protocol::FRAME_CANCEL, &[]).await;
     }
+    Ok(())
+}
+
+// ── Connect handler (TCP tunnels) ──────────────────────────────────────────
+
+const MAX_TUNNELS_PER_SESSION: usize = 64;
+
+#[derive(serde::Deserialize)]
+pub struct ConnectCommand {
+    pub host: String,
+    pub port: u16,
+    #[serde(default = "def_timeout")]
+    pub timeout: f64,
+}
+
+/// Handle `{"action":"connect", …}`: ask the target to dial `host:port` and
+/// relay the resulting stream over this control connection until either side
+/// closes.
+async fn connect_handler(
+    cmd: Command,
+    manager: &Arc<Mutex<SessionManager>>,
+    mut stream: ControlStream,
+    leftover: Vec<u8>,
+) -> Result<()> {
+    let id = cmd.id.unwrap_or(0);
+    let cc: ConnectCommand = match serde_json::from_str(&cmd.data.unwrap_or_default()) {
+        Ok(c) => c,
+        Err(e) => {
+            respond_error(&mut stream, format!("Invalid connect: {e}")).await;
+            return Ok(());
+        }
+    };
+
+    // Look up the session and reserve a stream id (no await while holding the
+    // manager lock).
+    let found = {
+        let mg = manager.lock().await;
+        match mg.sessions.get(&id) {
+            Some(ManagedSession::Smart(s)) if s.alive.load(Ordering::SeqCst) => Some((
+                Arc::clone(&s.writer),
+                Arc::clone(&s.tunnels),
+                s.supports_tunnels,
+                s.next_stream_id.fetch_add(1, Ordering::SeqCst),
+            )),
+            _ => None,
+        }
+    };
+    let Some((writer, tunnels, supports_tunnels, stream_id)) = found else {
+        respond_error(&mut stream, "Shell not found").await;
+        return Ok(());
+    };
+    if !supports_tunnels {
+        respond_error(
+            &mut stream,
+            "target agent does not support tunneling — upgrade ww-target",
+        )
+        .await;
+        return Ok(());
+    }
+    if tunnels.lock().await.len() >= MAX_TUNNELS_PER_SESSION {
+        let resp = json!({"status":"error","message":"too many tunnels on this session","errno":24});
+        let _ = respond_json(&mut stream, &resp).await;
+        return Ok(());
+    }
+
+    let (tx, mut rx) = mpsc::channel::<TunnelEvent>(64);
+    tunnels.lock().await.insert(stream_id, tx);
+
+    let open = protocol::TunnelOpen {
+        stream_id,
+        host: cc.host.clone(),
+        port: cc.port,
+        connect_timeout: cc.timeout,
+    };
+    {
+        let mut w = writer.lock().await;
+        if let Err(e) = frame::write_json_frame(&mut *w, protocol::FRAME_TUNNEL_OPEN, &open).await {
+            drop(w);
+            tunnels.lock().await.remove(&stream_id);
+            respond_error(&mut stream, format!("failed to send tunnel open: {e}")).await;
+            return Ok(());
+        }
+    }
+
+    let wait = cc.timeout.clamp(0.1, 3600.0) + 5.0;
+    let opened = match tokio::time::timeout(Duration::from_secs_f64(wait), rx.recv()).await {
+        Ok(Some(TunnelEvent::Opened(opened))) => opened,
+        Ok(Some(_)) => {
+            tunnels.lock().await.remove(&stream_id);
+            respond_error(&mut stream, "unexpected tunnel event").await;
+            return Ok(());
+        }
+        Ok(None) => {
+            tunnels.lock().await.remove(&stream_id);
+            respond_error(&mut stream, "target session closed").await;
+            return Ok(());
+        }
+        Err(_) => {
+            tunnels.lock().await.remove(&stream_id);
+            respond_error(&mut stream, "target did not answer the tunnel request").await;
+            return Ok(());
+        }
+    };
+
+    if !opened.ok {
+        tunnels.lock().await.remove(&stream_id);
+        let resp = json!({
+            "status":"error",
+            "message": opened.message.unwrap_or_else(|| "tunnel open failed".into()),
+            "errno": opened.errno,
+        });
+        let _ = respond_json(&mut stream, &resp).await;
+        return Ok(());
+    }
+
+    // Success: tell the client, then relay raw bytes.
+    let resp = json!({"status":"ok","bound": opened.bound});
+    let line = serde_json::to_string(&resp).unwrap_or_default() + "\n";
+    if stream.write_all(line.as_bytes()).is_err() || stream.flush().is_err() {
+        tunnels.lock().await.remove(&stream_id);
+        return Ok(());
+    }
+    stream.set_read_timeout(None)?;
+
+    let control = match stream.into_async() {
+        Ok(c) => c,
+        Err(e) => {
+            tunnels.lock().await.remove(&stream_id);
+            return Err(e.into());
+        }
+    };
+    relay_tunnel(control, writer, rx, leftover, stream_id, tunnels).await;
+    Ok(())
+}
+
+/// Relay bytes between the async control stream and the target session until
+/// either side closes, then release the tunnel sender.
+async fn relay_tunnel(
+    control: AsyncControl,
+    writer: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+    mut rx: mpsc::Receiver<TunnelEvent>,
+    leftover: Vec<u8>,
+    stream_id: u32,
+    tunnels: Tunnels,
+) {
+    let _ = relay_tunnel_inner(control, &writer, &mut rx, leftover, stream_id).await;
+    tunnels.lock().await.remove(&stream_id);
+}
+
+async fn write_tunnel_close(
+    writer: &Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+    stream_id: u32,
+    reason: &str,
+) {
+    let close = protocol::TunnelClose { stream_id, reason: reason.to_string() };
+    if let Ok(json) = serde_json::to_vec(&close) {
+        let mut w = writer.lock().await;
+        let _ = frame::write_frame(&mut *w, protocol::FRAME_TUNNEL_CLOSE, &json).await;
+    }
+}
+
+async fn relay_tunnel_inner(
+    mut control: AsyncControl,
+    writer: &Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+    rx: &mut mpsc::Receiver<TunnelEvent>,
+    leftover: Vec<u8>,
+    stream_id: u32,
+) -> Result<()> {
+    let mut control_open = true;
+
+    if !leftover.is_empty() {
+        let payload = protocol::tunnel_data_payload(stream_id, &leftover);
+        let mut w = writer.lock().await;
+        frame::write_frame(&mut *w, protocol::FRAME_TUNNEL_DATA, &payload).await?;
+    }
+
+    /// One step of the relay, decided inside `select!` and acted on outside it
+    /// (so `control` is not borrowed while we write to it).
+    enum Act {
+        ToTarget(Vec<u8>),
+        ToControl(Vec<u8>),
+        TargetEof,
+        TargetClosed(String),
+        ClientEof,
+        ClientErr,
+        SessionGone,
+    }
+
+    let mut buf = vec![0_u8; 32 * 1024];
+    loop {
+        let act = if control_open {
+            tokio::select! {
+                event = rx.recv() => match event {
+                    Some(TunnelEvent::Data(bytes)) => Act::ToControl(bytes),
+                    Some(TunnelEvent::Eof) => Act::TargetEof,
+                    Some(TunnelEvent::Closed(reason)) => Act::TargetClosed(reason),
+                    Some(TunnelEvent::Opened(_)) => continue,
+                    None => Act::SessionGone,
+                },
+                read = control.read(&mut buf) => match read {
+                    Ok(0) => Act::ClientEof,
+                    Ok(n) => Act::ToTarget(buf[..n].to_vec()),
+                    Err(_) => Act::ClientErr,
+                },
+            }
+        } else {
+            match rx.recv().await {
+                Some(TunnelEvent::Data(bytes)) => Act::ToControl(bytes),
+                Some(TunnelEvent::Eof) => Act::TargetEof,
+                Some(TunnelEvent::Closed(reason)) => Act::TargetClosed(reason),
+                Some(TunnelEvent::Opened(_)) => continue,
+                None => Act::SessionGone,
+            }
+        };
+
+        match act {
+            Act::ToTarget(bytes) => write_tunnel_data(writer, stream_id, &bytes).await?,
+            Act::ToControl(bytes) => {
+                control.write_all(&bytes).await?;
+                control.flush().await?;
+            }
+            // The target's destination reached EOF: half-close our write side
+            // of the control connection so the local client sees EOF.
+            Act::TargetEof => control.shutdown().await?,
+            Act::TargetClosed(reason) => {
+                write_tunnel_close(writer, stream_id, &reason).await;
+                return Ok(());
+            }
+            // The local client closed its write side: half-close the target.
+            Act::ClientEof => {
+                write_tunnel_eof(writer, stream_id).await?;
+                control_open = false;
+            }
+            Act::ClientErr => {
+                write_tunnel_close(writer, stream_id, "control read failed").await;
+                return Ok(());
+            }
+            Act::SessionGone => {
+                write_tunnel_close(writer, stream_id, "session closed").await;
+                return Ok(());
+            }
+        }
+    }
+}
+
+async fn write_tunnel_data(
+    writer: &Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+    stream_id: u32,
+    bytes: &[u8],
+) -> Result<()> {
+    let payload = protocol::tunnel_data_payload(stream_id, bytes);
+    let mut w = writer.lock().await;
+    frame::write_frame(&mut *w, protocol::FRAME_TUNNEL_DATA, &payload).await?;
+    Ok(())
+}
+
+async fn write_tunnel_eof(
+    writer: &Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+    stream_id: u32,
+) -> Result<()> {
+    let mut w = writer.lock().await;
+    frame::write_frame(&mut *w, protocol::FRAME_TUNNEL_EOF, &stream_id.to_le_bytes()).await?;
     Ok(())
 }
 

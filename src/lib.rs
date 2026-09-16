@@ -1,3 +1,4 @@
+pub mod socks;
 pub mod target;
 
 use serde::{Deserialize, Serialize};

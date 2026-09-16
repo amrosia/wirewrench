@@ -5,7 +5,10 @@ compile_error!("ww is only intended to be built for unix platforms");
 mod config;
 
 use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
+use std::net::ToSocketAddrs;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -75,6 +78,41 @@ enum Commands {
     Targ {
         #[command(subcommand)]
         action: TargAction,
+    },
+    /// Forward a local TCP port to a host reachable by the target
+    Forward {
+        id: u32,
+        /// Local listen spec: `[bind:]lport:host:port` (default bind 127.0.0.1)
+        #[arg(short = 'L', long = "listen")]
+        listen: String,
+        /// Seconds to wait for the target to connect (default 10)
+        #[arg(short = 't', long, default_value_t = 10.0)]
+        timeout: f64,
+    },
+    /// SOCKS5 / HTTP CONNECT proxy through the target
+    Socks {
+        id: u32,
+        /// Local listen address
+        #[arg(long, default_value = "127.0.0.1:1080")]
+        listen: String,
+        /// Resolve destination names locally instead of on the target
+        #[arg(long)]
+        local_dns: bool,
+        /// Require SOCKS5 username/password auth (RFC 1929)
+        #[arg(long)]
+        socks_user: Option<String>,
+        /// SOCKS5 password (use with --socks-user)
+        #[arg(long)]
+        socks_pass: Option<String>,
+        /// Disable HTTP CONNECT; only speak SOCKS5
+        #[arg(long)]
+        socks_only: bool,
+        /// Seconds to wait for the target to connect (default 10)
+        #[arg(long, default_value_t = 10.0)]
+        connect_timeout: f64,
+        /// Stop the listener if the target session disconnects
+        #[arg(long)]
+        exit_on_disconnect: bool,
     },
 }
 
@@ -149,6 +187,13 @@ impl ClientStream {
             ClientStream::Tcp(s) => s.set_read_timeout(dur),
         }
     }
+
+    fn shutdown_write(&self) -> std::io::Result<()> {
+        match self {
+            ClientStream::Unix(s) => s.shutdown(std::net::Shutdown::Write),
+            ClientStream::Tcp(s) => s.shutdown(std::net::Shutdown::Write),
+        }
+    }
 }
 
 /// Open a raw TCP connection to `host:port`.
@@ -169,32 +214,81 @@ fn unix_connect(socket: &str) -> Result<ClientStream> {
     Ok(ClientStream::Unix(stream))
 }
 
-/// Open a control connection.  When a host is configured (CLI `--host` or
-/// `host` in client.conf), connects and authenticates over TCP; otherwise the
-/// Unix socket path is used (never authenticated).
-fn connect(cli: &Cli) -> Result<ClientStream> {
-    if let Some(addr) = resolve_host(cli)? {
-        let label = if cli.host.is_some() { "--host" } else { "client.conf 'host'" };
-        let (host, port) = parse_host_port(&addr, label)?;
-        let identities = resolve_identities(cli)?;
-        let mut stream = tcp_connect(&host, port)?;
-        if identities.is_empty() {
-            return Ok(stream);
-        }
-        match auth_handshake(&mut stream, &identities)? {
-            AuthOutcome::Authenticated => Ok(stream),
-            AuthOutcome::ProceedNoAuth => {
-                eprintln!("info: you specified a key but the server does not use authentication — proceeding without key");
-                Ok(stream)
-            }
-            AuthOutcome::Reconnect => {
-                eprintln!("info: you specified a key but the server does not use authentication — proceeding without key");
-                tcp_connect(&host, port)
-            }
-        }
-    } else {
-        unix_connect(&cli.socket)
+/// Resolved client connection settings plus private keys loaded once.
+#[derive(Clone)]
+struct ClientConfig {
+    /// `Some((host, port))` for the TCP control channel; `None` for the Unix socket.
+    host: Option<(String, u16)>,
+    socket: String,
+    ids: Identities,
+}
+
+/// Private keys loaded once and reused for every control connection.
+#[derive(Clone)]
+struct Identities(Arc<Vec<(PrivateKey, ssh_key::PublicKey)>>);
+
+impl Identities {
+    fn empty() -> Self {
+        Self(Arc::new(Vec::new()))
     }
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl ClientConfig {
+    /// Resolve the control target (CLI `--host` / client.conf) and load any
+    /// configured private keys once.
+    fn resolve(cli: &Cli) -> Result<Self> {
+        let host = match resolve_host(cli)? {
+            Some(addr) => {
+                let label = if cli.host.is_some() { "--host" } else { "client.conf 'host'" };
+                Some(parse_host_port(&addr, label)?)
+            }
+            None => None,
+        };
+        let ids = if host.is_some() {
+            load_identities(cli)?
+        } else {
+            Identities::empty()
+        };
+        Ok(Self { host, socket: cli.socket.clone(), ids })
+    }
+
+    /// Open a control connection.  When a host is configured, connects and
+    /// authenticates over TCP; otherwise the Unix socket path is used (never
+    /// authenticated).
+    fn connect(&self) -> Result<ClientStream> {
+        if let Some((host, port)) = &self.host {
+            let mut stream = tcp_connect(host, *port)?;
+            if self.ids.is_empty() {
+                return Ok(stream);
+            }
+            match auth_handshake(&mut stream, &self.ids)? {
+                AuthOutcome::Authenticated => Ok(stream),
+                AuthOutcome::ProceedNoAuth => {
+                    eprintln!("info: you specified a key but the server does not use authentication — proceeding without key");
+                    Ok(stream)
+                }
+                AuthOutcome::Reconnect => {
+                    eprintln!("info: you specified a key but the server does not use authentication — proceeding without key");
+                    tcp_connect(host, *port)
+                }
+            }
+        } else {
+            unix_connect(&self.socket)
+        }
+    }
+}
+
+/// Load all configured private keys once (`-i`, or client.conf `identity`).
+fn load_identities(cli: &Cli) -> Result<Identities> {
+    let paths = resolve_identities(cli)?;
+    let mut keys = Vec::new();
+    for path in paths {
+        keys.push(load_private_key(&path)?);
+    }
+    Ok(Identities(Arc::new(keys)))
 }
 
 /// Resolve the control target: `-H/--host` if given, otherwise the `host =`
@@ -292,16 +386,15 @@ fn read_line_json(stream: &mut ClientStream) -> Result<Value> {
 }
 
 /// Perform the SSH-style auth handshake over an already-connected TCP stream.
-fn auth_handshake(stream: &mut ClientStream, identities: &[String]) -> Result<AuthOutcome> {
+fn auth_handshake(stream: &mut ClientStream, ids: &Identities) -> Result<AuthOutcome> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     let mut tried = 0usize;
     let mut last_fp = String::new();
 
-    for path in identities {
-        let (private_key, public_key) = load_private_key(path)?;
+    for (private_key, public_key) in ids.0.iter() {
         let openssh = public_key
             .to_openssh()
-            .map_err(|e| anyhow::anyhow!("failed to encode public key for '{path}': {e}"))?;
+            .map_err(|e| anyhow::anyhow!("failed to encode public key: {e}"))?;
 
         write_line(stream, &serde_json::json!({"type":"auth_offer","key": openssh}))?;
         let resp = match read_line_json(stream) {
@@ -317,7 +410,7 @@ fn auth_handshake(stream: &mut ClientStream, identities: &[String]) -> Result<Au
                     .to_bytes()
                     .map_err(|e| anyhow::anyhow!("failed to encode public key: {e}"))?;
                 let payload = wauth::signed_payload(&challenge, &key_blob);
-                let sig: ssh_key::Signature = Signer::try_sign(&private_key, &payload)
+                let sig: ssh_key::Signature = Signer::try_sign(private_key, &payload)
                     .map_err(|e| anyhow::anyhow!("signing failed: {e}"))?;
                 let sig_b64 = wauth::b64_encode(&sig.to_vec());
                 write_line(stream, &serde_json::json!({"type":"auth_sign","signature": sig_b64}))?;
@@ -377,8 +470,8 @@ fn print_server_error(msg: &str) {
     }
 }
 
-fn send_cmd(cli: &Cli, cmd: &Value) -> Result<Value> {
-    let mut stream = connect(cli)?;
+fn send_cmd(cfg: &ClientConfig, cmd: &Value) -> Result<Value> {
+    let mut stream = cfg.connect()?;
     let json = serde_json::to_string(cmd)? + "\n";
     stream.write_all(json.as_bytes())?;
     let mut reader = BufReader::new(&mut stream);
@@ -391,8 +484,8 @@ fn send_cmd(cli: &Cli, cmd: &Value) -> Result<Value> {
     Ok(val)
 }
 
-fn send_cmd_raw(cli: &Cli, cmd: &Value) -> Result<ClientStream> {
-    let mut stream = connect(cli)?;
+fn send_cmd_raw(cfg: &ClientConfig, cmd: &Value) -> Result<ClientStream> {
+    let mut stream = cfg.connect()?;
     let json = serde_json::to_string(cmd)? + "\n";
     stream.write_all(json.as_bytes())?;
     Ok(stream)
@@ -400,8 +493,8 @@ fn send_cmd_raw(cli: &Cli, cmd: &Value) -> Result<ClientStream> {
 
 // ── List ───────────────────────────────────────────────────────────────────
 
-fn cmd_list(cli: &Cli) -> Result<()> {
-    let resp = send_cmd(cli, &serde_json::json!({"action": "list"}))?;
+fn cmd_list(cfg: &ClientConfig) -> Result<()> {
+    let resp = send_cmd(cfg, &serde_json::json!({"action": "list"}))?;
     if resp["status"] == "ok" {
         let shells = &resp["shells"];
         let arr = shells.as_array().map_or(&[] as &[serde_json::Value], std::vec::Vec::as_slice);
@@ -434,8 +527,8 @@ fn cmd_list(cli: &Cli) -> Result<()> {
 
 // ── Send ───────────────────────────────────────────────────────────────────
 
-fn cmd_send(cli: &Cli, id: u32, command: &str, timeout: f64) -> Result<()> {
-    let resp = send_cmd(cli, &serde_json::json!({
+fn cmd_send(cfg: &ClientConfig, id: u32, command: &str, timeout: f64) -> Result<()> {
+    let resp = send_cmd(cfg, &serde_json::json!({
         "action": "send", "id": id, "data": format!("{}\n", command),
         "timeout": timeout
     }))?;
@@ -475,8 +568,8 @@ fn cmd_send(cli: &Cli, id: u32, command: &str, timeout: f64) -> Result<()> {
 
 // ── Close ──────────────────────────────────────────────────────────────────
 
-fn cmd_close(cli: &Cli, id: u32) -> Result<()> {
-    let resp = send_cmd(cli, &serde_json::json!({
+fn cmd_close(cfg: &ClientConfig, id: u32) -> Result<()> {
+    let resp = send_cmd(cfg, &serde_json::json!({
         "action": "close", "id": id
     }))?;
     if resp["status"] == "ok" {
@@ -490,7 +583,7 @@ fn cmd_close(cli: &Cli, id: u32) -> Result<()> {
 
 // ── Script ─────────────────────────────────────────────────────────────────
 
-fn cmd_script(cli: &Cli, id: u32, file: &str) -> Result<()> {
+fn cmd_script(cfg: &ClientConfig, id: u32, file: &str) -> Result<()> {
     let content = std::fs::read_to_string(file)
         .with_context(|| format!("Cannot read file '{file}'"))?;
     let lines: Vec<&str> = content
@@ -502,7 +595,7 @@ fn cmd_script(cli: &Cli, id: u32, file: &str) -> Result<()> {
     println!("[+] Running {} commands on shell #{}", lines.len(), id);
     for cmd in &lines {
         println!("\n→ {cmd}");
-        let resp = send_cmd(cli, &serde_json::json!({
+        let resp = send_cmd(cfg, &serde_json::json!({
             "action": "send", "id": id, "data": format!("{}\n", cmd)
         }))?;
         if resp["status"] == "error" {
@@ -510,7 +603,7 @@ fn cmd_script(cli: &Cli, id: u32, file: &str) -> Result<()> {
             continue;
         }
         std::thread::sleep(Duration::from_millis(300));
-        let resp = send_cmd(cli, &serde_json::json!({
+        let resp = send_cmd(cfg, &serde_json::json!({
             "action": "read", "id": id, "timeout": 2.0
         }))?;
         if resp["status"] == "ok"
@@ -524,7 +617,7 @@ fn cmd_script(cli: &Cli, id: u32, file: &str) -> Result<()> {
 
 // ── Targ push ──────────────────────────────────────────────────────────────
 
-fn cmd_targ_upload(cli: &Cli, id: u32, local: &str, remote: Option<&str>, timeout: f64) -> Result<()> {
+fn cmd_targ_upload(cfg: &ClientConfig, id: u32, local: &str, remote: Option<&str>, timeout: f64) -> Result<()> {
     let file_data = std::fs::read(local)
         .with_context(|| format!("Cannot read file '{local}'"))?;
     let size = file_data.len();
@@ -535,7 +628,7 @@ fn cmd_targ_upload(cli: &Cli, id: u32, local: &str, remote: Option<&str>, timeou
     };
 
     let push_data = serde_json::json!({"path": remote_path, "size": size, "timeout": timeout});
-    let mut stream = connect(cli)?;
+    let mut stream = cfg.connect()?;
     stream.set_read_timeout(Some(Duration::from_secs((timeout + 5.0).max(10.0) as u64)))?;
 
     let cmd_json = serde_json::json!({"action":"push","id":id,"data":push_data.to_string()});
@@ -559,9 +652,9 @@ fn cmd_targ_upload(cli: &Cli, id: u32, local: &str, remote: Option<&str>, timeou
 
 // ── Targ pull ──────────────────────────────────────────────────────────────
 
-fn cmd_targ_download(cli: &Cli, id: u32, remote: &str, local: Option<&str>, timeout: f64) -> Result<()> {
+fn cmd_targ_download(cfg: &ClientConfig, id: u32, remote: &str, local: Option<&str>, timeout: f64) -> Result<()> {
     let pull_data = serde_json::json!({"path": remote, "timeout": timeout});
-    let mut stream = connect(cli)?;
+    let mut stream = cfg.connect()?;
     stream.set_read_timeout(Some(Duration::from_secs((timeout + 5.0).max(10.0) as u64)))?;
 
     let cmd_json = serde_json::json!({"action":"pull","id":id,"data":pull_data.to_string()});
@@ -615,8 +708,8 @@ fn cmd_targ_download(cli: &Cli, id: u32, remote: &str, local: Option<&str>, time
 
 // ── Targ cancel ────────────────────────────────────────────────────────────
 
-fn cmd_targ_cancel(cli: &Cli, id: u32) -> Result<()> {
-    let resp = send_cmd(cli, &serde_json::json!({"action":"targ_cancel","id":id}))?;
+fn cmd_targ_cancel(cfg: &ClientConfig, id: u32) -> Result<()> {
+    let resp = send_cmd(cfg, &serde_json::json!({"action":"targ_cancel","id":id}))?;
     if resp["status"] == "ok" {
         println!("Cancel sent for session #{id}");
     } else {
@@ -626,13 +719,341 @@ fn cmd_targ_cancel(cli: &Cli, id: u32) -> Result<()> {
     Ok(())
 }
 
+// ── Tunnels: forward / socks ───────────────────────────────────────────────
+
+/// Parse `[bind:]lport:host:port` (default bind `127.0.0.1`).
+fn parse_forward_spec(spec: &str) -> Result<(String, u16, String, u16)> {
+    let parts: Vec<&str> = spec.split(':').collect();
+    let (bind, lport, host, port) = match parts.as_slice() {
+        [l, h, p] => ("127.0.0.1", *l, *h, *p),
+        [b, l, h, p] => (*b, *l, *h, *p),
+        _ => anyhow::bail!("invalid listen spec '{spec}': expected [bind:]lport:host:port"),
+    };
+    let lport: u16 = lport.parse().with_context(|| format!("invalid local port in '{spec}'"))?;
+    let port: u16 = port.parse().with_context(|| format!("invalid remote port in '{spec}'"))?;
+    if lport == 0 || port == 0 {
+        anyhow::bail!("invalid listen spec '{spec}': ports must be between 1 and 65535");
+    }
+    Ok((bind.to_string(), lport, host.to_string(), port))
+}
+
+/// Parse a `HOST:PORT` listen address for the SOCKS listener.
+fn parse_listen_addr(listen: &str) -> Result<(String, u16)> {
+    let (host, port) = listen
+        .rsplit_once(':')
+        .with_context(|| format!("invalid --listen '{listen}': expected HOST:PORT"))?;
+    let port: u16 = port
+        .parse()
+        .with_context(|| format!("invalid --listen '{listen}': bad port"))?;
+    Ok((host.trim_start_matches('[').trim_end_matches(']').to_string(), port))
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host == "localhost" || host == "::1" || host == "[::1]" || host.starts_with("127.")
+}
+
+/// Error from `open_stream`, carrying the target errno for SOCKS reply mapping.
+#[derive(Debug)]
+struct OpenStreamError {
+    message: String,
+    errno: i32,
+}
+
+impl std::fmt::Display for OpenStreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for OpenStreamError {}
+
+/// Ask the server to open a tunnel through session `id` to `host:port` and
+/// return the control stream, positioned for raw relay.  The reply is read
+/// byte-at-a-time so no tunnel bytes are swallowed.
+fn open_stream(
+    cfg: &ClientConfig,
+    id: u32,
+    host: &str,
+    port: u16,
+    timeout: f64,
+) -> std::result::Result<ClientStream, OpenStreamError> {
+    let io_err = |message: String| OpenStreamError { message, errno: 0 };
+    let mut stream = cfg.connect().map_err(|e| io_err(format!("{e:#}")))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs_f64(
+            timeout.clamp(1.0, 3600.0) + 10.0,
+        )))
+        .map_err(|e| io_err(e.to_string()))?;
+
+    let data = serde_json::json!({"host": host, "port": port, "timeout": timeout}).to_string();
+    let cmd = serde_json::json!({"action": "connect", "id": id, "data": data});
+    let line = serde_json::to_string(&cmd).map_err(|e| io_err(e.to_string()))? + "\n";
+    if stream.write_all(line.as_bytes()).is_err() || stream.flush().is_err() {
+        return Err(io_err("failed to send connect request".into()));
+    }
+
+    let mut buf = Vec::new();
+    loop {
+        let mut byte = [0_u8; 1];
+        if stream.read_exact(&mut byte).is_err() {
+            return Err(io_err("connection closed while opening tunnel".into()));
+        }
+        if byte[0] == b'\n' {
+            break;
+        }
+        buf.push(byte[0]);
+        if buf.len() > 64 * 1024 {
+            return Err(io_err("oversized tunnel reply".into()));
+        }
+    }
+    let resp: Value = serde_json::from_slice(&buf).map_err(|e| io_err(format!("invalid tunnel reply: {e}")))?;
+    if resp["status"].as_str() == Some("ok") {
+        let _ = stream.set_read_timeout(None);
+        Ok(stream)
+    } else {
+        Err(OpenStreamError {
+            message: resp["message"].as_str().unwrap_or("tunnel open failed").to_string(),
+            errno: resp["errno"].as_i64().unwrap_or(0).try_into().unwrap_or(0),
+        })
+    }
+}
+
+/// Relay a local TCP socket <-> tunnel control stream, propagating half-close
+/// in both directions.
+fn relay_local(local: std::net::TcpStream, mut control: ClientStream) -> Result<()> {
+    let mut local_read = local.try_clone()?;
+    let mut control_write = control.try_clone()?;
+    let up = std::thread::spawn(move || {
+        let _ = std::io::copy(&mut local_read, &mut control_write);
+        let _ = control_write.shutdown_write();
+    });
+    let mut local_write = local;
+    let _ = std::io::copy(&mut control, &mut local_write);
+    let _ = local_write.shutdown(std::net::Shutdown::Write);
+    let _ = up.join();
+    Ok(())
+}
+
+/// `ww forward <id> -L [bind:]lport:host:port` — one local port, one tunnel
+/// per accepted connection.
+fn cmd_forward(cfg: &ClientConfig, id: u32, listen: &str, timeout: f64) -> Result<()> {
+    let (bind, lport, host, rport) = parse_forward_spec(listen)?;
+    let listener = std::net::TcpListener::bind((bind.as_str(), lport))
+        .with_context(|| format!("cannot bind {bind}:{lport}"))?;
+    eprintln!("[+] Forwarding {bind}:{lport} -> {host}:{rport} via session #{id}");
+    loop {
+        match listener.accept() {
+            Ok((client, _)) => {
+                let cfg = cfg.clone();
+                let host = host.clone();
+                std::thread::spawn(move || {
+                    match open_stream(&cfg, id, &host, rport, timeout) {
+                        Ok(stream) => {
+                            let _ = relay_local(client, stream);
+                        }
+                        Err(e) => eprintln!("[-] forward: {e}"),
+                    }
+                });
+            }
+            Err(e) => eprintln!("[-] forward accept error: {e}"),
+        }
+    }
+}
+
+/// `ww socks <id>` — SOCKS5 + HTTP CONNECT proxy on one local port.
+#[allow(clippy::too_many_arguments)]
+fn cmd_socks(
+    cfg: &ClientConfig,
+    id: u32,
+    listen: &str,
+    local_dns: bool,
+    socks_user: Option<String>,
+    socks_pass: Option<String>,
+    socks_only: bool,
+    connect_timeout: f64,
+    exit_on_disconnect: bool,
+) -> Result<()> {
+    if socks_user.is_some() != socks_pass.is_some() {
+        anyhow::bail!("--socks-user and --socks-pass must be given together");
+    }
+    let auth = match (socks_user.as_deref(), socks_pass.as_deref()) {
+        (Some(u), Some(p)) => Some((u.to_string(), p.to_string())),
+        _ => None,
+    };
+    let (bind, port) = parse_listen_addr(listen)?;
+    if !is_loopback_host(&bind) {
+        eprintln!("[!] ⚠ WARNING: SOCKS proxy bound to non-loopback address {bind}:{port}");
+        eprintln!("[!]   Anyone who can reach it can pivot through the target.");
+    }
+    let listener = std::net::TcpListener::bind((bind.as_str(), port))
+        .with_context(|| format!("cannot bind {bind}:{port}"))?;
+    listener.set_nonblocking(true)?;
+    eprintln!("[+] SOCKS5/HTTP-CONNECT proxy on {bind}:{port} via session #{id}");
+
+    let disconnected = Arc::new(AtomicBool::new(false));
+    let hinted = Arc::new(AtomicBool::new(false));
+    loop {
+        if exit_on_disconnect && disconnected.load(Ordering::SeqCst) {
+            break;
+        }
+        match listener.accept() {
+            Ok((client, peer)) => {
+                let _ = client.set_nonblocking(false);
+                let cfg = cfg.clone();
+                let auth = auth.clone();
+                let disconnected = Arc::clone(&disconnected);
+                let hinted = Arc::clone(&hinted);
+                std::thread::spawn(move || {
+                    handle_socks_client(
+                        client,
+                        &cfg,
+                        id,
+                        auth,
+                        local_dns,
+                        socks_only,
+                        connect_timeout,
+                        &disconnected,
+                        &hinted,
+                    );
+                });
+                let _ = peer;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => {
+                eprintln!("[-] socks accept error: {e}");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolve_dest(req: &wirewrench::socks::Request, local_dns: bool) -> (String, u16) {
+    if !local_dns {
+        return (req.host.clone(), req.port);
+    }
+    match (req.host.as_str(), req.port).to_socket_addrs() {
+        Ok(mut addrs) => match addrs.next() {
+            Some(a) => (a.ip().to_string(), a.port()),
+            None => (req.host.clone(), req.port),
+        },
+        Err(_) => (req.host.clone(), req.port),
+    }
+}
+
+fn note_disconnect(disconnected: &AtomicBool, hinted: &AtomicBool) {
+    disconnected.store(true, Ordering::SeqCst);
+    if !hinted.swap(true, Ordering::SeqCst) {
+        eprintln!("[!] target session disconnected — listener kept; use --exit-on-disconnect to stop");
+    }
+}
+
+fn is_missing_session(message: &str) -> bool {
+    message.contains("Shell not found") || message.contains("does not support tunneling")
+}
+
+fn http_code_from_errno(errno: i32) -> (u16, &'static str) {
+    match errno {
+        110 | 60 | 10060 => (504, "Gateway Timeout"),
+        _ => (502, "Bad Gateway"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_socks_client(
+    mut client: std::net::TcpStream,
+    cfg: &ClientConfig,
+    id: u32,
+    auth: Option<(String, String)>,
+    local_dns: bool,
+    socks_only: bool,
+    connect_timeout: f64,
+    disconnected: &AtomicBool,
+    hinted: &AtomicBool,
+) {
+    let _ = client.set_read_timeout(Some(Duration::from_secs(10)));
+
+    // Detect the protocol without consuming payload (`peek`, not a BufReader).
+    let mut first = [0_u8; 1];
+    match client.peek(&mut first) {
+        Ok(0) | Err(_) => return,
+        Ok(_) => {}
+    }
+
+    if wirewrench::socks::detect_proto(first[0]) == wirewrench::socks::Proto::HttpConnect {
+        if socks_only {
+            wirewrench::socks::write_http_reply(&mut client, 501, "Not Implemented");
+            return;
+        }
+        let req = match wirewrench::socks::read_http_connect(&mut client) {
+            Ok(r) => r,
+            Err(wirewrench::socks::Error::NotConnect) => {
+                wirewrench::socks::write_http_reply(&mut client, 501, "Not Implemented");
+                return;
+            }
+            Err(_) => {
+                wirewrench::socks::write_http_reply(&mut client, 400, "Bad Request");
+                return;
+            }
+        };
+        let (host, port) = resolve_dest(&req, local_dns);
+        match open_stream(cfg, id, &host, port, connect_timeout) {
+            Ok(stream) => {
+                wirewrench::socks::write_http_reply(&mut client, 200, "Connection established");
+                let _ = client.set_read_timeout(None);
+                let _ = relay_local(client, stream);
+            }
+            Err(e) => {
+                let (code, reason) = http_code_from_errno(e.errno);
+                wirewrench::socks::write_http_reply(&mut client, code, reason);
+                if is_missing_session(&e.message) {
+                    note_disconnect(disconnected, hinted);
+                }
+            }
+        }
+        return;
+    }
+
+    // SOCKS5
+    let auth_ref = auth.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
+    match wirewrench::socks::greet(&mut client, auth_ref) {
+        Ok(true) => {}
+        _ => return,
+    }
+    let req = match wirewrench::socks::read_request(&mut client) {
+        Ok(r) => r,
+        Err(wirewrench::socks::Error::Code(code)) => {
+            wirewrench::socks::write_reply(&mut client, code);
+            return;
+        }
+        Err(_) => return,
+    };
+    let (host, port) = resolve_dest(&req, local_dns);
+    match open_stream(cfg, id, &host, port, connect_timeout) {
+        Ok(stream) => {
+            wirewrench::socks::write_reply(&mut client, 0x00);
+            let _ = client.set_read_timeout(None);
+            let _ = relay_local(client, stream);
+        }
+        Err(e) => {
+            let code = wirewrench::socks::reply_code_from_errno(e.errno);
+            wirewrench::socks::write_reply(&mut client, code);
+            if is_missing_session(&e.message) {
+                note_disconnect(disconnected, hinted);
+            }
+        }
+    }
+}
+
 // ── Interact ───────────────────────────────────────────────────────────────
 
-fn cmd_interact(cli: &Cli, id: u32) -> Result<()> {
+fn cmd_interact(cfg: &ClientConfig, id: u32) -> Result<()> {
     use rustyline::DefaultEditor;
     use rustyline::error::ReadlineError;
 
-    let mut stream = send_cmd_raw(cli, &serde_json::json!({
+    let mut stream = send_cmd_raw(cfg, &serde_json::json!({
         "action": "interact", "id": id
     }))?;
 
@@ -724,8 +1145,9 @@ fn cmd_interact(cli: &Cli, id: u32) -> Result<()> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let cfg = ClientConfig::resolve(&cli)?;
     match &cli.command {
-        Commands::List => cmd_list(&cli),
+        Commands::List => cmd_list(&cfg),
         Commands::Send { id, command, stdin, timeout } => {
             let cmd_str = if *stdin {
                 let mut buf = String::new();
@@ -734,21 +1156,40 @@ fn main() -> Result<()> {
             } else {
                 command.join(" ")
             };
-            cmd_send(&cli, *id, &cmd_str, *timeout)
+            cmd_send(&cfg, *id, &cmd_str, *timeout)
         }
-        Commands::Interact { id } => cmd_interact(&cli, *id),
-        Commands::Close { id } => cmd_close(&cli, *id),
-        Commands::Script { id, file } => cmd_script(&cli, *id, file),
+        Commands::Interact { id } => cmd_interact(&cfg, *id),
+        Commands::Close { id } => cmd_close(&cfg, *id),
+        Commands::Script { id, file } => cmd_script(&cfg, *id, file),
         Commands::Targ { action } => match action {
             TargAction::Upload { id, local, remote, timeout } => {
-                cmd_targ_upload(&cli, *id, local, remote.as_deref(), *timeout)
+                cmd_targ_upload(&cfg, *id, local, remote.as_deref(), *timeout)
             }
             TargAction::Download { id, remote, local, timeout } => {
-                cmd_targ_download(&cli, *id, remote, local.as_deref(), *timeout)
+                cmd_targ_download(&cfg, *id, remote, local.as_deref(), *timeout)
             }
-            TargAction::Cancel { id } => {
-                cmd_targ_cancel(&cli, *id)
-            }
-        }
+            TargAction::Cancel { id } => cmd_targ_cancel(&cfg, *id),
+        },
+        Commands::Forward { id, listen, timeout } => cmd_forward(&cfg, *id, listen, *timeout),
+        Commands::Socks {
+            id,
+            listen,
+            local_dns,
+            socks_user,
+            socks_pass,
+            socks_only,
+            connect_timeout,
+            exit_on_disconnect,
+        } => cmd_socks(
+            &cfg,
+            *id,
+            listen,
+            *local_dns,
+            socks_user.clone(),
+            socks_pass.clone(),
+            *socks_only,
+            *connect_timeout,
+            *exit_on_disconnect,
+        ),
     }
 }

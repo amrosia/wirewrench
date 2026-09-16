@@ -14,9 +14,18 @@
 #  10. TCP control channel (ww-server --control-port + ww -H host:port)
 #  11. Control-port key authentication (ssh-keygen, --auth-keys, ww -i)
 #  12. Config-file defaults (client.conf host + identity, CLI precedence)
+#  13. Concurrent command output + 5 MB upload (P1 regression)
+#  14. ww forward over the Unix socket and the TCP control channel
+#  15. ww socks: SOCKS5 (ATYP=3) + HTTP CONNECT; --socks-only; absolute-URI 501
+#  16. Tunnel error codes (refused / unreachable, BIND, UDP)
+#  17. Session death wakes relays; the listener survives a reconnect
+#  18. WW_NO_TUNNEL refuses tunneling without hanging
+#  19. Half-close propagation and --max-streams
+#  20. Idle SOCKS client is dropped by the handshake timeout
 #
 # Usage: ./tests/e2e_target.sh
-# Requires: ww, ww-server, ww-target on PATH (ssh-keygen for tests 11-12)
+# Requires: ww, ww-server, ww-target on PATH (ssh-keygen for tests 11-12,
+#           python3 for tests 13-20)
 
 set -euo pipefail
 
@@ -404,6 +413,378 @@ if [ -f /tmp/ww_test_auth_ed25519.pub ]; then
     kill $CFG_SRV_PID 2>/dev/null || true
     kill $CFG_TGT_PID 2>/dev/null || true
 fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tunnel tests (13-20): dedicated server + target on ports 4474/4475/4476.
+# ─────────────────────────────────────────────────────────────────────────────
+
+TUN_SOCK=/tmp/ww_test_tunnel.sock
+WWW_DIR=/tmp/ww_test_www
+HTTP_PORT=8099
+LIVE_ID=1
+
+# Kill every helper started by the tunnel tests (called from the EXIT trap).
+tunnel_cleanup() {
+    for p in ${FWD1:-} ${FWD2:-} ${SOCK1:-} ${SOCK2:-} ${SOCK3:-} ${MAX_SOCK:-} \
+             ${HALF_FWD:-} ${NOTUN_FWD:-} ${BG:-} ${TUN_SRV:-} ${TUN_TGT:-} \
+             ${HTTP_PID:-} ${HOLD_PID:-} ${HALF_PID:-} ${MAX_SRV:-} ${MAX_TGT:-} \
+             ${MAX_HOLD:-} ${NOTUN_SRV:-} ${NOTUN_TGT:-} ${TUNNEL_CLIENT:-}; do
+        [ -n "$p" ] && kill "$p" 2>/dev/null || true
+    done
+    sleep 0.3
+    for p in ${FWD1:-} ${FWD2:-} ${SOCK1:-} ${SOCK2:-} ${SOCK3:-} ${MAX_SOCK:-} \
+             ${HALF_FWD:-} ${NOTUN_FWD:-} ${BG:-} ${TUN_SRV:-} ${TUN_TGT:-} \
+             ${HTTP_PID:-} ${HOLD_PID:-} ${HALF_PID:-} ${MAX_SRV:-} ${MAX_TGT:-} \
+             ${MAX_HOLD:-} ${NOTUN_SRV:-} ${NOTUN_TGT:-} ${TUNNEL_CLIENT:-}; do
+        [ -n "$p" ] && kill -9 "$p" 2>/dev/null || true
+    done
+}
+trap 'cleanup; tunnel_cleanup' EXIT
+
+mkdir -p "$WWW_DIR"
+printf 'tunnel-body-ok\n' > "$WWW_DIR/index.html"
+python3 -m http.server "$HTTP_PORT" --bind 127.0.0.1 --directory "$WWW_DIR" >/tmp/ww_test_http.log 2>&1 &
+HTTP_PID=$!
+ww-server -p 4474 -P 4476 -c 4475 -s "$TUN_SOCK" >/tmp/ww_test_tunnel_srv.log 2>&1 &
+TUN_SRV=$!
+sleep 1
+ww-target 127.0.0.1 -p 4476 --poll 1 --no-reconnect >/tmp/ww_test_tunnel_tgt.log 2>&1 &
+TUN_TGT=$!
+sleep 2
+
+header "13. Concurrent command output + 5 MB upload (P1 regression)"
+dd if=/dev/urandom of=/tmp/ww_test_big.bin bs=1M count=5 2>/dev/null
+BIGHASH=$(sha256sum /tmp/ww_test_big.bin | awk '{print $1}')
+ww -s "$TUN_SOCK" send 1 "i=0; while [ \$i -lt 400 ]; do echo tick-\$i; i=\$((i+1)); sleep 0.005; done; echo bg-done" >/tmp/ww_test_bg.log 2>&1 &
+BG=$!
+sleep 0.2
+OUT=$(ww -s "$TUN_SOCK" targ upload 1 /tmp/ww_test_big.bin /tmp/ww_test_big_dst.bin -t 60 2>/dev/null || true)
+wait $BG 2>/dev/null || true
+if echo "$OUT" | grep -q "$BIGHASH"; then
+    pass "5 MB upload verifies while a command runs concurrently"
+else
+    fail "concurrent 5 MB upload failed"
+    echo "  Got: $OUT"
+fi
+if grep -q "bg-done" /tmp/ww_test_bg.log; then
+    pass "concurrent command completed (no frames dropped)"
+else
+    fail "concurrent command did not complete"
+fi
+
+header "14. ww forward (Unix socket and TCP control channel)"
+ww -s "$TUN_SOCK" forward 1 -L 127.0.0.1:8181:127.0.0.1:$HTTP_PORT >/tmp/ww_test_fwd.log 2>&1 &
+FWD1=$!
+ww -H 127.0.0.1:4475 forward 1 -L 127.0.0.1:8182:127.0.0.1:$HTTP_PORT >/tmp/ww_test_fwd_tcp.log 2>&1 &
+FWD2=$!
+sleep 1
+OUT=$(curl -s --max-time 6 http://127.0.0.1:8181/index.html || true)
+if echo "$OUT" | grep -q "tunnel-body-ok"; then
+    pass "forward over Unix socket relays the body"
+else
+    fail "forward over Unix socket failed"
+    echo "  Got: $OUT"
+fi
+OUT=$(curl -s --max-time 6 http://127.0.0.1:8182/index.html || true)
+if echo "$OUT" | grep -q "tunnel-body-ok"; then
+    pass "forward over TCP control channel relays the body"
+else
+    fail "forward over TCP control channel failed"
+    echo "  Got: $OUT"
+fi
+kill $FWD1 $FWD2 2>/dev/null || true
+sleep 0.3
+
+header "15. ww socks (SOCKS5 ATYP=3, HTTP CONNECT, --socks-only)"
+ww -s "$TUN_SOCK" socks 1 --listen 127.0.0.1:18080 >/tmp/ww_test_socks.log 2>&1 &
+SOCK1=$!
+ww -s "$TUN_SOCK" socks 1 --listen 127.0.0.1:18081 --socks-only >/tmp/ww_test_socks_only.log 2>&1 &
+SOCK2=$!
+sleep 1
+OUT=$(curl -s --max-time 6 --socks5-hostname 127.0.0.1:18080 http://localhost:$HTTP_PORT/index.html || true)
+if echo "$OUT" | grep -q "tunnel-body-ok"; then
+    pass "SOCKS5 with a hostname (ATYP=3) relays the body"
+else
+    fail "SOCKS5 hostname request failed"
+    echo "  Got: $OUT"
+fi
+PAR_PIDS=""
+for i in 1 2 3 4 5 6 7 8; do
+    (curl -s --max-time 8 --socks5-hostname 127.0.0.1:18080 http://localhost:$HTTP_PORT/index.html >"/tmp/ww_test_par_$i.out" 2>/dev/null || true) &
+    PAR_PIDS="$PAR_PIDS $!"
+done
+wait $PAR_PIDS 2>/dev/null || true
+PAR_OK=1
+for i in 1 2 3 4 5 6 7 8; do
+    grep -q "tunnel-body-ok" "/tmp/ww_test_par_$i.out" || PAR_OK=0
+done
+if [ "$PAR_OK" = 1 ]; then
+    pass "8 parallel SOCKS5 tunnels all return the body"
+else
+    fail "parallel SOCKS5 tunnels failed"
+fi
+
+OUT=$(curl -s --max-time 6 -x http://127.0.0.1:18080 --proxytunnel http://localhost:$HTTP_PORT/index.html || true)
+if echo "$OUT" | grep -q "tunnel-body-ok"; then
+    pass "HTTP CONNECT relays the body"
+else
+    fail "HTTP CONNECT failed"
+    echo "  Got: $OUT"
+fi
+OUT=$(curl -sS --max-time 6 -x http://127.0.0.1:18081 --proxytunnel http://localhost:$HTTP_PORT/index.html 2>&1 || true)
+if echo "$OUT" | grep -q "501"; then
+    pass "--socks-only refuses HTTP CONNECT (501)"
+else
+    fail "--socks-only did not refuse HTTP CONNECT"
+    echo "  Got: $OUT"
+fi
+OUT=$(python3 - <<'PY'
+import socket
+s=socket.create_connection(('127.0.0.1',18080),timeout=5)
+s.sendall(b'GET http://localhost/index.html HTTP/1.1\r\nHost: localhost\r\n\r\n')
+try:
+    print(s.recv(200).decode(errors='replace').splitlines()[0])
+except Exception as e:
+    print('err', e)
+PY
+)
+if echo "$OUT" | grep -q "501"; then
+    pass "absolute-URI GET via the proxy -> 501"
+else
+    fail "absolute-URI GET did not get 501"
+    echo "  Got: $OUT"
+fi
+
+header "16. tunnel error codes (refused, unreachable, BIND, UDP)"
+ww -s "$TUN_SOCK" socks 1 --listen 127.0.0.1:18082 --connect-timeout 2 >/tmp/ww_test_socks_to.log 2>&1 &
+SOCK3=$!
+sleep 1
+SOCKS_RAW=$(python3 - <<'PY'
+import socket
+def req(port, payload):
+    s=socket.create_connection(('127.0.0.1',port),timeout=10)
+    s.sendall(b'\x05\x01\x00'); s.recv(2)
+    s.sendall(payload)
+    return s.recv(10).hex()
+print('closed', req(18080, b'\x05\x01\x00\x01\x7f\x00\x00\x01\x00\x09'))
+print('blackhole', req(18082, b'\x05\x01\x00\x01\xc0\x00\x02\x01\x00\x50'))
+print('bind', req(18080, b'\x05\x02\x00\x01\x7f\x00\x00\x01\x00\x50'))
+print('udp', req(18080, b'\x05\x03\x00\x01\x7f\x00\x00\x01\x00\x50'))
+PY
+)
+if echo "$SOCKS_RAW" | grep -q "closed 0505"; then
+    pass "connection refused -> 0x05"
+else
+    fail "closed port did not map to 0x05"
+    echo "  $SOCKS_RAW"
+fi
+if echo "$SOCKS_RAW" | grep -qE "blackhole 05(03|04|06)"; then
+    pass "unreachable/black-holed host -> 0x03/0x04/0x06"
+else
+    fail "black-holed host did not map to a network error"
+    echo "  $SOCKS_RAW"
+fi
+if echo "$SOCKS_RAW" | grep -q "bind 0507"; then
+    pass "BIND -> 0x07"
+else
+    fail "BIND did not map to 0x07"
+    echo "  $SOCKS_RAW"
+fi
+if echo "$SOCKS_RAW" | grep -q "udp 0507"; then
+    pass "UDP ASSOCIATE -> 0x07"
+else
+    fail "UDP did not map to 0x07"
+    echo "  $SOCKS_RAW"
+fi
+
+header "17. session death wakes relays; listener survives reconnect"
+python3 - >/tmp/ww_test_hold.log 2>&1 <<'PY' &
+import socket
+srv=socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(('127.0.0.1',8097)); srv.listen(5)
+conns=[]
+while True:
+    c,_=srv.accept(); conns.append(c)
+PY
+HOLD_PID=$!
+sleep 1
+python3 - <<'PY' &
+import socket
+try:
+    s=socket.create_connection(('127.0.0.1',18080),timeout=5)
+    s.sendall(b'\x05\x01\x00'); s.recv(2)
+    s.sendall(b'\x05\x01\x00\x03\x09' + b'127.0.0.1' + b'\x1f\xa1')
+    r=s.recv(10)
+    open('/tmp/ww_test_tunnel_reply.txt','w').write(r.hex())
+    s.settimeout(20)
+    d=s.recv(1)
+    open('/tmp/ww_test_tunnel_eof.txt','w').write('eof' if d==b'' else 'data')
+except Exception as e:
+    open('/tmp/ww_test_tunnel_eof.txt','w').write('err:'+str(e))
+PY
+TUNNEL_CLIENT=$!
+sleep 1.5
+kill -9 $TUN_TGT 2>/dev/null || true
+sleep 2
+if [ -f /tmp/ww_test_tunnel_reply.txt ] && grep -q '^0500' /tmp/ww_test_tunnel_reply.txt; then
+    pass "long-lived tunnel opened (0x00)"
+else
+    fail "long-lived tunnel did not open"
+    cat /tmp/ww_test_tunnel_reply.txt 2>/dev/null || true
+fi
+if [ -f /tmp/ww_test_tunnel_eof.txt ] && grep -q eof /tmp/ww_test_tunnel_eof.txt; then
+    pass "session death closed the local tunnel (EOF)"
+else
+    fail "local tunnel did not see EOF on session death"
+    cat /tmp/ww_test_tunnel_eof.txt 2>/dev/null || true
+fi
+kill $TUNNEL_CLIENT 2>/dev/null || true
+ww-target 127.0.0.1 -p 4476 --poll 1 --no-reconnect >/tmp/ww_test_tunnel_tgt2.log 2>&1 &
+TUN_TGT=$!
+sleep 3
+# The agent gets a new session id on reconnect; the listeners stay bound to
+# their original id, so remember the new one for the remaining tunnel tests.
+LIVE_ID=$(ww -s "$TUN_SOCK" list 2>/dev/null | awk '/\[ww-target\]/{print $1; exit}')
+[ -n "$LIVE_ID" ] || LIVE_ID=1
+OUT=$(python3 - <<'PY'
+import socket
+s=socket.create_connection(('127.0.0.1',18080),timeout=5)
+s.sendall(b'\x05\x01\x00'); s.recv(2)
+s.sendall(b'\x05\x01\x00\x01\x7f\x00\x00\x01\x1f\xa1')
+try:
+    print(s.recv(10).hex())
+except Exception as e:
+    print('err', e)
+PY
+)
+if echo "$OUT" | grep -q '^0501'; then
+    pass "listener survives and reports 0x01 for the dead session id"
+else
+    fail "listener did not report 0x01 after session death"
+    echo "  Got: $OUT"
+fi
+kill $HOLD_PID 2>/dev/null || true
+
+header "18. WW_NO_TUNNEL refuses tunneling (no hang)"
+ww-server -p 4484 -P 4486 -s /tmp/ww_test_notun.sock >/tmp/ww_test_notun_srv.log 2>&1 &
+NOTUN_SRV=$!
+sleep 1
+WW_NO_TUNNEL=1 ww-target 127.0.0.1 -p 4486 --poll 1 --no-reconnect >/tmp/ww_test_notun_tgt.log 2>&1 &
+NOTUN_TGT=$!
+sleep 2
+ww -s /tmp/ww_test_notun.sock forward 1 -L 127.0.0.1:8184:127.0.0.1:$HTTP_PORT >/tmp/ww_test_notun_fwd.log 2>&1 &
+NOTUN_FWD=$!
+sleep 1
+curl -s --max-time 4 http://127.0.0.1:8184/index.html >/dev/null 2>&1 || true
+sleep 0.3
+if grep -q "does not support tunneling" /tmp/ww_test_notun_fwd.log; then
+    pass "tunneling refused with an actionable message"
+else
+    fail "WW_NO_TUNNEL did not produce the expected refusal"
+    cat /tmp/ww_test_notun_fwd.log
+fi
+kill $NOTUN_SRV $NOTUN_TGT $NOTUN_FWD 2>/dev/null || true
+
+header "19. half-close propagation and --max-streams"
+python3 - >/tmp/ww_test_half.log 2>&1 <<'PY' &
+import socket
+srv=socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(('127.0.0.1',8096)); srv.listen(5)
+c,_=srv.accept()
+data=b''
+while True:
+    b=c.recv(4096)
+    if not b: break
+    data+=b
+c.sendall(b'AFTER-EOF\n')
+c.close()
+PY
+HALF_PID=$!
+sleep 1
+ww -s "$TUN_SOCK" forward "$LIVE_ID" -L 127.0.0.1:8185:127.0.0.1:8096 >/tmp/ww_test_half_fwd.log 2>&1 &
+HALF_FWD=$!
+sleep 1
+OUT=$(python3 - <<'PY'
+import socket
+s=socket.create_connection(('127.0.0.1',8185),timeout=8)
+s.sendall(b'PING\n')
+s.shutdown(socket.SHUT_WR)
+s.settimeout(8)
+data=b''
+try:
+    while True:
+        c=s.recv(4096)
+        if not c: break
+        data+=c
+except Exception:
+    pass
+print(data.decode(errors='replace').strip())
+PY
+)
+if echo "$OUT" | grep -q "AFTER-EOF"; then
+    pass "half-close propagated (read-to-EOF then reply)"
+else
+    fail "half-close was not propagated"
+    echo "  Got: $OUT"
+fi
+
+python3 - >/tmp/ww_test_maxhold.log 2>&1 <<'PY' &
+import socket
+srv=socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(('127.0.0.1',8095)); srv.listen(5)
+conns=[]
+while True:
+    c,_=srv.accept(); conns.append(c)
+PY
+MAX_HOLD=$!
+ww-server -p 4494 -P 4496 -s /tmp/ww_test_max.sock >/tmp/ww_test_max_srv.log 2>&1 &
+MAX_SRV=$!
+sleep 1
+ww-target 127.0.0.1 -p 4496 --max-streams 2 --no-reconnect >/tmp/ww_test_max_tgt.log 2>&1 &
+MAX_TGT=$!
+sleep 2
+ww -s /tmp/ww_test_max.sock socks 1 --listen 127.0.0.1:18085 >/tmp/ww_test_max_socks.log 2>&1 &
+MAX_SOCK=$!
+sleep 1
+OUT=$(python3 - <<'PY'
+import socket
+holds=[]
+for _ in range(3):
+    s=socket.create_connection(('127.0.0.1',18085),timeout=5)
+    s.sendall(b'\x05\x01\x00'); s.recv(2)
+    s.sendall(b'\x05\x01\x00\x03\x09' + b'127.0.0.1' + b'\x1f\x9f')
+    holds.append(s.recv(10).hex())
+print(' '.join(holds))
+PY
+)
+if echo "$OUT" | grep -q "05000001000000000000 05000001000000000000 0501"; then
+    pass "--max-streams 2 refuses the third tunnel with 0x01"
+else
+    fail "max-streams enforcement failed"
+    echo "  Got: $OUT"
+fi
+kill $MAX_SRV $MAX_TGT $MAX_SOCK $MAX_HOLD 2>/dev/null || true
+
+header "20. idle SOCKS client is dropped by the handshake timeout"
+OUT=$(python3 - <<'PY'
+import socket
+s=socket.create_connection(('127.0.0.1',18080),timeout=5)
+s.settimeout(15)
+try:
+    d=s.recv(1)
+    print('closed' if d==b'' else 'open')
+except Exception:
+    print('still-open')
+PY
+)
+if echo "$OUT" | grep -q "closed"; then
+    pass "idle client dropped after the handshake timeout"
+else
+    fail "idle client was not dropped"
+    echo "  Got: $OUT"
+fi
+
+tunnel_cleanup
 
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""

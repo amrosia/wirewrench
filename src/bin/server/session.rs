@@ -1,10 +1,10 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::io::AsyncReadExt;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 use wirewrench::target::protocol;
 use wirewrench::ShellInfo;
@@ -68,11 +68,35 @@ impl ShellSession {
 
 pub type PendingCmds = Arc<Mutex<HashMap<u64, oneshot::Sender<protocol::CmdResult>>>>;
 
+/// Events delivered from a ww-target session's reader task to a tunnel relay.
+pub enum TunnelEvent {
+    Opened(protocol::TunnelOpened),
+    Data(Vec<u8>),
+    Eof,
+    Closed(String),
+}
+
+pub type Tunnels = Arc<Mutex<HashMap<u32, mpsc::Sender<TunnelEvent>>>>;
+
+/// Deliver a tunnel event to its relay, dropping the sender when the relay is
+/// gone or too slow (a full channel resets that stream only).
+async fn deliver_tunnel(tunnels: &Tunnels, stream_id: u32, event: TunnelEvent) {
+    let mut map = tunnels.lock().await;
+    let Some(tx) = map.get(&stream_id) else { return };
+    if tx.try_send(event).is_err() {
+        map.remove(&stream_id);
+    }
+}
+
 pub struct SmartSession {
     id: u32,
     addr: String,
     created: f64,
     platform: Option<String>,
+    /// Capabilities advertised by the target during the handshake.
+    #[allow(dead_code)] // kept for introspection; `supports_tunnels` is derived
+    pub features: Vec<String>,
+    pub supports_tunnels: bool,
     pub writer: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
     pub shell_buf: Arc<Mutex<Vec<u8>>>,
     pub ctrl_queue: CtrlQueue,
@@ -80,11 +104,13 @@ pub struct SmartSession {
     pub in_file_transfer: Arc<AtomicBool>,
     pub next_cmd_seq: AtomicU64,
     pub pending_cmds: PendingCmds,
+    pub tunnels: Tunnels,
+    pub next_stream_id: AtomicU32,
     reader_handle: tokio::task::JoinHandle<()>,
 }
 
 impl SmartSession {
-    pub fn new(id: u32, addr: String, platform: Option<String>, stream: tokio::net::TcpStream) -> Self {
+    pub fn new(id: u32, addr: String, platform: Option<String>, features: Vec<String>, stream: tokio::net::TcpStream) -> Self {
         let (reader, writer) = stream.into_split();
         let writer = Arc::new(Mutex::new(writer));
         let alive = Arc::new(AtomicBool::new(true));
@@ -92,12 +118,15 @@ impl SmartSession {
         let ctrl_queue: CtrlQueue = Arc::new(Mutex::new(std::collections::VecDeque::new()));
         let in_file_transfer = Arc::new(AtomicBool::new(false));
         let pending_cmds: PendingCmds = Arc::new(Mutex::new(HashMap::new()));
+        let supports_tunnels = features.iter().any(|f| f == protocol::FEATURE_TUNNEL);
+        let tunnels: Tunnels = Arc::new(Mutex::new(HashMap::new()));
 
         let shell_clone = Arc::clone(&shell_buf);
         let ctrl_clone = Arc::clone(&ctrl_queue);
         let alive_clone = Arc::clone(&alive);
         let ift_clone = Arc::clone(&in_file_transfer);
         let pending_clone = Arc::clone(&pending_cmds);
+        let tunnels_clone = Arc::clone(&tunnels);
 
         let reader_handle = tokio::spawn(async move {
             let mut r = reader;
@@ -123,12 +152,37 @@ impl SmartSession {
                     protocol::FRAME_CANCEL => {
                         ift_clone.store(false, Ordering::SeqCst);
                     }
+                    protocol::FRAME_TUNNEL_OPENED => {
+                        if let Ok(opened) = serde_json::from_slice::<protocol::TunnelOpened>(&payload) {
+                            let id = opened.stream_id;
+                            deliver_tunnel(&tunnels_clone, id, TunnelEvent::Opened(opened)).await;
+                        }
+                    }
+                    protocol::FRAME_TUNNEL_DATA => {
+                        if let Some(id) = protocol::tunnel_stream_id(&payload) {
+                            deliver_tunnel(&tunnels_clone, id, TunnelEvent::Data(payload[4..].to_vec())).await;
+                        }
+                    }
+                    protocol::FRAME_TUNNEL_EOF => {
+                        if let Some(id) = protocol::tunnel_stream_id(&payload) {
+                            deliver_tunnel(&tunnels_clone, id, TunnelEvent::Eof).await;
+                        }
+                    }
+                    protocol::FRAME_TUNNEL_CLOSE => {
+                        if let Ok(close) = serde_json::from_slice::<protocol::TunnelClose>(&payload) {
+                            deliver_tunnel(&tunnels_clone, close.stream_id, TunnelEvent::Closed(close.reason)).await;
+                        }
+                    }
                     _ => {}
                 }
             }
+            // Session death must wake every relay blocked in `recv()`.  Drop
+            // all senders so each relay sees `None` and closes its control
+            // connection.
+            tunnels_clone.lock().await.clear();
         });
 
-        Self { id, addr, created: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(), platform, writer, shell_buf, ctrl_queue, alive, in_file_transfer, next_cmd_seq: AtomicU64::new(1), pending_cmds, reader_handle }
+        Self { id, addr, created: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(), platform, features, supports_tunnels, writer, shell_buf, ctrl_queue, alive, in_file_transfer, next_cmd_seq: AtomicU64::new(1), pending_cmds, tunnels, next_stream_id: AtomicU32::new(1), reader_handle }
     }
 
     pub fn info(&self) -> ShellInfo {
@@ -189,9 +243,9 @@ impl SessionManager {
         self.sessions.insert(id, ManagedSession::Tcp(session, buf)); id
     }
 
-    pub fn add_smart(&mut self, addr: String, platform: Option<String>, stream: tokio::net::TcpStream) -> u32 {
+    pub fn add_smart(&mut self, addr: String, platform: Option<String>, features: Vec<String>, stream: tokio::net::TcpStream) -> u32 {
         let id = self.next_id; self.next_id += 1;
-        let session = SmartSession::new(id, addr, platform, stream);
+        let session = SmartSession::new(id, addr, platform, features, stream);
         self.sessions.insert(id, ManagedSession::Smart(session)); id
     }
 

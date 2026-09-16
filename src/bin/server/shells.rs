@@ -62,11 +62,14 @@ pub async fn smart_listener(manager: Arc<Mutex<SessionManager>>, host: &str, por
                         Err(e) => { eprintln!("[-] Invalid handshake from {addr}: {e}"); return; }
                     };
 
-                    let id = { let mut mg = mgr.lock().await; mg.add_smart(addr.clone(), hs.platform.clone(), stream) };
+                    let id = { let mut mg = mgr.lock().await; mg.add_smart(addr.clone(), hs.platform.clone(), hs.features.clone(), stream) };
 
                     // Send handshake response
                     let session_id = uuid::Uuid::new_v4().to_string();
-                    let resp = protocol::Handshake::new_server(session_id);
+                    let resp = protocol::Handshake::new_server(
+                        session_id,
+                        vec![protocol::FEATURE_TUNNEL.to_string()],
+                    );
                     let res = {
                         let mg = mgr.lock().await;
                         match mg.sessions.get(&id) {

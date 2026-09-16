@@ -1,6 +1,6 @@
 [package]
 name = "wirewrench"
-version = "3.2.0"
+version = "3.4.0"
 edition = "2024"
 autobins = false
 license = "AGPL-3.0-or-later"
@@ -21,7 +21,7 @@ name = "ww-target"
 path = "src/bin/target.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["net", "rt", "sync", "time", "io-util", "macros"] }
+tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "sync", "time", "io-util", "macros"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
