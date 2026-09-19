@@ -1,6 +1,6 @@
 [package]
 name = "wirewrench"
-version = "3.5.0"
+version = "3.5.1"
 edition = "2024"
 autobins = false
 license = "AGPL-3.0-or-later"

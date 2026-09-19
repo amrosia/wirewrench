@@ -1091,6 +1091,28 @@ fn http_code_from_errno(errno: i32) -> (u16, &'static str) {
 const HANDSHAKE_BUDGET: Duration = Duration::from_secs(15);
 const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Half-close and drain before dropping a refused connection.
+///
+/// Dropping a socket that still has unread bytes in its receive queue makes the
+/// kernel send `RST` rather than `FIN`, and an `RST` can destroy a reply that
+/// was already written to that socket — the client then reports "connection
+/// reset by peer" and never sees the status we sent.  The early refusals
+/// (501/400) happen before the request has been read, so consume whatever the
+/// peer sent first, then close cleanly.  Bounded so a peer cannot make us drain
+/// forever.
+fn finish_reply(client: &mut std::net::TcpStream) {
+    let _ = client.shutdown(std::net::Shutdown::Write);
+    let _ = client.set_read_timeout(Some(Duration::from_millis(200)));
+    let mut buf = [0_u8; 4096];
+    let mut budget: usize = 64 * 1024;
+    while budget > 0 {
+        match client.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => budget = budget.saturating_sub(n),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_socks_client(
     mut client: std::net::TcpStream,
@@ -1119,16 +1141,19 @@ fn handle_socks_client(
         // it whenever credentials are configured (fail closed).
         if socks_only || auth.is_some() {
             wirewrench::socks::write_http_reply(&mut client, 501, "Not Implemented");
+            finish_reply(&mut client);
             return;
         }
         let req = match wirewrench::socks::read_http_connect(&mut client, deadline) {
             Ok(r) => r,
             Err(wirewrench::socks::Error::NotConnect) => {
                 wirewrench::socks::write_http_reply(&mut client, 501, "Not Implemented");
+                finish_reply(&mut client);
                 return;
             }
             Err(_) => {
                 wirewrench::socks::write_http_reply(&mut client, 400, "Bad Request");
+                finish_reply(&mut client);
                 return;
             }
         };
@@ -1142,6 +1167,7 @@ fn handle_socks_client(
             Err(e) => {
                 let (code, reason) = http_code_from_errno(e.errno);
                 wirewrench::socks::write_http_reply(&mut client, code, reason);
+                finish_reply(&mut client);
                 if is_missing_session(&e.message) {
                     note_disconnect(disconnected, hinted);
                 }
@@ -1160,6 +1186,7 @@ fn handle_socks_client(
         Ok(r) => r,
         Err(wirewrench::socks::Error::Code(code)) => {
             wirewrench::socks::write_reply(&mut client, code);
+            finish_reply(&mut client);
             return;
         }
         Err(_) => return,
@@ -1174,6 +1201,7 @@ fn handle_socks_client(
         Err(e) => {
             let code = wirewrench::socks::reply_code_from_errno(e.errno);
             wirewrench::socks::write_reply(&mut client, code);
+            finish_reply(&mut client);
             if is_missing_session(&e.message) {
                 note_disconnect(disconnected, hinted);
             }

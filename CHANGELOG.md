@@ -1,5 +1,22 @@
 # Changelog
 
+## v3.5.1 — fix HTTP CONNECT refusals being lost to a TCP reset
+
+- **`ww socks` error replies could vanish.**  When the proxy refused a request
+before reading it — HTTP CONNECT on a `--socks-only` or credential-protected
+port, or a malformed request — it wrote the `501`/`400` and then dropped the
+socket with the request bytes still queued.  Linux answers that with `RST`
+instead of `FIN`, and an `RST` discards data already sent, so clients
+intermittently saw `Recv failure: Connection reset by peer` instead of the
+status line.  This is what made the CI `e2e-linux` job flaky (it failed on the
+`--socks-only` 501 check and on the absolute-URI 501 check).  Refusals now
+half-close and drain the pending request before closing (bounded, so a peer
+cannot make us drain forever), so the reply is always delivered.
+- `tests/e2e_target.sh`: the two `501` checks now read the complete status line
+and repeat (10× and 5×) so this regression is caught rather than passing by
+luck; several other checks use a `recvn` helper instead of a single `recv`,
+which could also observe a partial read.
+
 ## v3.5.0 — session locks for dumb shells
 
 Dumb reverse shells have no framing: commands are written raw and output is read

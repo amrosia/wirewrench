@@ -535,27 +535,42 @@ else
     fail "HTTP CONNECT failed"
     echo "  Got: $OUT"
 fi
-OUT=$(curl -sS --max-time 6 -x http://127.0.0.1:18081 --proxytunnel http://localhost:$HTTP_PORT/index.html 2>&1 || true)
-if echo "$OUT" | grep -q "501"; then
-    pass "--socks-only refuses HTTP CONNECT (501)"
+# Repeat: closing a socket with the request still unread used to trigger an
+# RST that destroyed the 501, so a single attempt would pass only by luck.
+SO501=0
+for _ in $(seq 1 10); do
+    OUT=$(curl -sS --max-time 6 -x http://127.0.0.1:18081 --proxytunnel http://localhost:$HTTP_PORT/index.html 2>&1 || true)
+    echo "$OUT" | grep -q "501" && SO501=$((SO501+1))
+done
+if [ "$SO501" = 10 ]; then
+    pass "--socks-only refuses HTTP CONNECT (501) 10/10"
 else
-    fail "--socks-only did not refuse HTTP CONNECT"
+    fail "--socks-only did not refuse HTTP CONNECT ($SO501/10)"
     echo "  Got: $OUT"
 fi
-OUT=$(python3 - <<'PY'
+ABS501=0
+for _ in $(seq 1 5); do
+  OUT=$(python3 - <<'PY'
 import socket
 s=socket.create_connection(('127.0.0.1',18080),timeout=5)
 s.sendall(b'GET http://localhost/index.html HTTP/1.1\r\nHost: localhost\r\n\r\n')
+data=b''
 try:
-    print(s.recv(200).decode(errors='replace').splitlines()[0])
+    while b'\r\n' not in data:   # read the whole status line, not one segment
+        c=s.recv(200)
+        if not c: break
+        data+=c
+    print(data.split(b'\r\n')[0].decode(errors='replace'))
 except Exception as e:
     print('err', e)
 PY
 )
-if echo "$OUT" | grep -q "501"; then
-    pass "absolute-URI GET via the proxy -> 501"
+  echo "$OUT" | grep -q "501" && ABS501=$((ABS501+1))
+done
+if [ "$ABS501" = 5 ]; then
+    pass "absolute-URI GET via the proxy -> 501 (5/5)"
 else
-    fail "absolute-URI GET did not get 501"
+    fail "absolute-URI GET did not get 501 ($ABS501/5)"
     echo "  Got: $OUT"
 fi
 
@@ -565,11 +580,18 @@ SOCK3=$!
 sleep 1
 SOCKS_RAW=$(python3 - <<'PY'
 import socket
+def recvn(s, n):
+    b=b''
+    while len(b)<n:
+        c=s.recv(n-len(b))
+        if not c: break
+        b+=c
+    return b
 def req(port, payload):
     s=socket.create_connection(('127.0.0.1',port),timeout=10)
-    s.sendall(b'\x05\x01\x00'); s.recv(2)
+    s.sendall(b'\x05\x01\x00'); recvn(s,2)
     s.sendall(payload)
-    return s.recv(10).hex()
+    return recvn(s,10).hex()
 print('closed', req(18080, b'\x05\x01\x00\x01\x7f\x00\x00\x01\x00\x09'))
 print('blackhole', req(18082, b'\x05\x01\x00\x01\xc0\x00\x02\x01\x00\x50'))
 print('bind', req(18080, b'\x05\x02\x00\x01\x7f\x00\x00\x01\x00\x50'))
@@ -614,11 +636,18 @@ HOLD_PID=$!
 sleep 1
 python3 - <<'PY' &
 import socket
+def recvn(s, n):
+    b=b''
+    while len(b)<n:
+        c=s.recv(n-len(b))
+        if not c: break
+        b+=c
+    return b
 try:
     s=socket.create_connection(('127.0.0.1',18080),timeout=5)
-    s.sendall(b'\x05\x01\x00'); s.recv(2)
+    s.sendall(b'\x05\x01\x00'); recvn(s,2)
     s.sendall(b'\x05\x01\x00\x03\x09' + b'127.0.0.1' + b'\x1f\xa1')
-    r=s.recv(10)
+    r=recvn(s,10)
     open('/tmp/ww_test_tunnel_reply.txt','w').write(r.hex())
     s.settimeout(20)
     d=s.recv(1)
@@ -652,11 +681,18 @@ LIVE_ID=$(ww -s "$TUN_SOCK" list 2>/dev/null | awk '/\[ww-target\]/{print $1; ex
 [ -n "$LIVE_ID" ] || LIVE_ID=1
 OUT=$(python3 - <<'PY'
 import socket
+def recvn(s, n):
+    b=b''
+    while len(b)<n:
+        c=s.recv(n-len(b))
+        if not c: break
+        b+=c
+    return b
 s=socket.create_connection(('127.0.0.1',18080),timeout=5)
-s.sendall(b'\x05\x01\x00'); s.recv(2)
+s.sendall(b'\x05\x01\x00'); recvn(s,2)
 s.sendall(b'\x05\x01\x00\x01\x7f\x00\x00\x01\x1f\xa1')
 try:
-    print(s.recv(10).hex())
+    print(recvn(s,10).hex())
 except Exception as e:
     print('err', e)
 PY
@@ -752,12 +788,19 @@ MAX_SOCK=$!
 sleep 1
 OUT=$(python3 - <<'PY'
 import socket
+def recvn(s, n):
+    b=b''
+    while len(b)<n:
+        c=s.recv(n-len(b))
+        if not c: break
+        b+=c
+    return b
 holds=[]
 for _ in range(3):
     s=socket.create_connection(('127.0.0.1',18085),timeout=5)
-    s.sendall(b'\x05\x01\x00'); s.recv(2)
+    s.sendall(b'\x05\x01\x00'); recvn(s,2)
     s.sendall(b'\x05\x01\x00\x03\x09' + b'127.0.0.1' + b'\x1f\x9f')
-    holds.append(s.recv(10).hex())
+    holds.append(recvn(s,10).hex())
 print(' '.join(holds))
 PY
 )
@@ -889,13 +932,25 @@ BANNER_OK=0
 for _ in 1 2 3 4 5; do
     OUT=$(python3 - <<'PY'
 import socket
+def recvn(s, n):
+    b=b''
+    while len(b)<n:
+        c=s.recv(n-len(b))
+        if not c: break
+        b+=c
+    return b
 s = socket.create_connection(('127.0.0.1', 18091), timeout=10)
 s.sendall(b'\x05\x01\x00')
-s.recv(2)
+recvn(s,2)
 s.sendall(b'\x05\x01\x00\x03\x09127.0.0.1\x1f\x9e')  # 127.0.0.1:8094
 try:
-    print(s.recv(10).hex())
-    print(s.recv(64).decode(errors='replace').strip())
+    print(recvn(s,10).hex())
+    banner=b''
+    while b'\n' not in banner:   # the banner can arrive in more than one segment
+        c=s.recv(64)
+        if not c: break
+        banner+=c
+    print(banner.decode(errors='replace').strip())
 except Exception as e:
     print('err', e)
 PY
