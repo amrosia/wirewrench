@@ -177,6 +177,11 @@ the `ww-target` agent; the only new listener is a local one on your machine
 feature — that is **v3.4.0 or later** (the tunneling work was developed as
 "3.3.0", but no 3.3.0 release was ever published).
 
+`ww forward` maps **one fixed destination**: the `-L [bind:]lport:host:port`
+spec names it up front.  Use `ww socks` when the destination is not known in
+advance — it listens on a single local port and the client names the target per
+connection, so any TCP host the agent can reach is one proxy setting away.
+
 ```bash
 # Forward one local port: [bind:]lport:host:port (default bind 127.0.0.1)
 ww forward 1 -L 127.0.0.1:8080:10.0.0.5:80

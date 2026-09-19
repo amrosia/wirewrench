@@ -42,7 +42,9 @@
   readers) on the multi-threaded runtime.
 - Docs: the README no longer claims the target *always* refuses to dial its own
   server (it is best-effort, and now also covers resolved addresses), and the
-  3.3.0 release notes are corrected (see below).
+  3.3.0 release notes are corrected (see below).  The pivoting section now also
+  states explicitly that `ww forward` maps one fixed destination while
+  `ww socks` is the arbitrary-destination listener to point a proxy at.
 
 ## v3.4.0 — `ww socks` (SOCKS5 + HTTP CONNECT)
 
