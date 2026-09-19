@@ -3,7 +3,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use rand::Rng;
@@ -20,6 +20,7 @@ use wirewrench::{Command, Response};
 
 use super::auth as srv_auth;
 use super::frame;
+use super::lock::{LockGuard, LockState, SessionLock};
 use super::session::{
     CtrlQueue, ManagedSession, SessionManager, TUNNEL_EVENT_QUEUE, TunnelEntry, TunnelEvent, Tunnels,
     overflow_reason,
@@ -268,7 +269,11 @@ fn read_line_raw(stream: &mut ControlStream) -> Result<Vec<u8>> {
 /// Run the SSH-style auth handshake on a TCP control connection.  Returns
 /// `true` if the client authenticated, `false` if the connection should be
 /// closed (a failure response has already been sent).
-fn authenticate(stream: &mut ControlStream, keys_path: &Path) -> Result<bool> {
+fn authenticate(
+    stream: &mut ControlStream,
+    keys_path: &Path,
+    identity_out: &mut Option<String>,
+) -> Result<bool> {
     // Per-connection key load (fail closed): rotation applies immediately.
     let keys = match srv_auth::load_authorized_keys(keys_path) {
         Ok(k) => k,
@@ -331,7 +336,9 @@ fn authenticate(stream: &mut ControlStream, keys_path: &Path) -> Result<bool> {
                 let payload = wauth::signed_payload(&challenge, &key_blob);
 
                 if srv_auth::verify_signature(authorized, &payload, sig_b64) {
-                    eprintln!("[+] Control-port auth ok: {} (TCP)", authorized.fingerprint(HashAlg::Sha256));
+                    let fingerprint = authorized.fingerprint(HashAlg::Sha256);
+                    eprintln!("[+] Control-port auth ok: {fingerprint} (TCP)");
+                    *identity_out = Some(format!("{fingerprint} (key)"));
                     let _ = write_json_line(stream, &json!({"status":"ok"}));
                     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
                     return Ok(true);
@@ -353,15 +360,114 @@ fn authenticate(stream: &mut ControlStream, keys_path: &Path) -> Result<bool> {
     Ok(false)
 }
 
+// ── Control connection identity ────────────────────────────────────────────
+
+/// Identity and lease policy of one control connection.  Session locks are
+/// owned by this connection id, so a lock is released as soon as the handler
+/// returns — which is the moment the client's socket closes, even if the
+/// client was killed.  (See `super::lock`.)
+#[derive(Clone)]
+pub struct ConnCtx {
+    pub id: u64,
+    /// `"unix"` or `"tcp"`.
+    pub transport: &'static str,
+    pub authenticated: bool,
+    /// Human-readable holder identity (`ben (uid=1000)`, a key fingerprint, …).
+    pub owner: String,
+    /// Lease TTL.  `None` for Unix sockets, where close is reliable and a
+    /// half-open connection is impossible.
+    pub lease: Option<Duration>,
+}
+
+impl ConnCtx {
+    #[must_use]
+    pub fn json(&self) -> Value {
+        json!({
+            "transport": self.transport,
+            "authenticated": self.authenticated,
+            "identity": self.owner,
+            "lease_secs": self.lease.map(|d| d.as_secs()),
+        })
+    }
+}
+
+/// `list` view of a lock that refused a request.
+fn lock_json(state: &LockState, conn: u64) -> Value {
+    json!({
+        "owner": state.owner,
+        "mine": state.conn == conn,
+        "held_for": state.held_for(),
+        "expires_in": state.expires_in(),
+    })
+}
+
+/// Acquire the session lock for `conn`, honouring `--wait` and `--force`.
+///
+/// On contention this writes the `busy` response itself and returns `Ok(None)`.
+/// The returned guard releases the lock when dropped, so the caller must keep
+/// it alive for as long as the session is in use.
+async fn acquire_or_refuse(
+    lock: &Arc<SessionLock>,
+    conn: &ConnCtx,
+    cmd: &Command,
+    stream: &mut ControlStream,
+    ttl: Option<Duration>,
+) -> Result<Option<LockGuard>> {
+    if cmd.force {
+        return Ok(Some(lock.force_acquire(conn.id, &conn.owner, ttl)));
+    }
+    match lock.acquire(conn.id, &conn.owner, ttl, cmd.wait.unwrap_or(0.0)).await {
+        Ok(guard) => Ok(Some(guard)),
+        Err(held) => {
+            let msg = format!(
+                "session is locked by {} for {:.0}s (use --force to take it over, or --wait SECS)",
+                held.owner,
+                held.held_for()
+            );
+            respond_json(stream, &Response::busy(msg, lock_json(&held, conn.id))).await?;
+            Ok(None)
+        }
+    }
+}
+
+/// Resolve a uid to a user name via `/etc/passwd` (no extra dependency).
+fn uid_name(uid: u32) -> Option<String> {
+    let content = std::fs::read_to_string("/etc/passwd").ok()?;
+    for line in content.lines() {
+        let mut fields = line.split(':');
+        let (name, _, id) = (fields.next(), fields.next(), fields.next());
+        if let (Some(name), Some(id)) = (name, id)
+            && id.parse::<u32>() == Ok(uid)
+            && !name.is_empty()
+        {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
 // ── Handle a single control client ─────────────────────────────────────────
 
 /// Handle a `ww` client connected over the Unix control socket (never authenticated).
 pub async fn handle_control_unix(
     stream: tokio::net::UnixStream,
     manager: Arc<Mutex<SessionManager>>,
+    conn_id: u64,
+    lease: Option<Duration>,
 ) -> Result<()> {
+    let owner = match stream.peer_cred() {
+        Ok(cred) => {
+            let uid = cred.uid();
+            match uid_name(uid) {
+                Some(name) => format!("{name} (uid={uid})"),
+                None => format!("uid={uid}"),
+            }
+        }
+        Err(_) => "local unix socket".to_string(),
+    };
+    let conn = ConnCtx { id: conn_id, transport: "unix", authenticated: false, owner, lease };
     let stream = stream.into_std()?;
-    handle_control_conn(ControlStream::Unix(stream), manager, None).await
+    handle_control_conn(ControlStream::Unix(stream), manager, None, &conn).await
 }
 
 /// Handle a `ww` client connected over the optional TCP control port
@@ -370,17 +476,23 @@ pub async fn handle_control_tcp(
     stream: tokio::net::TcpStream,
     manager: Arc<Mutex<SessionManager>>,
     auth_keys_path: Option<Arc<std::path::PathBuf>>,
+    conn_id: u64,
+    lease: Option<Duration>,
 ) -> Result<()> {
+    let owner = stream.peer_addr().map_or_else(|_| "tcp peer".to_string(), |a| a.to_string());
+    let conn = ConnCtx { id: conn_id, transport: "tcp", authenticated: false, owner, lease };
     let stream = stream.into_std()?;
     let keys = auth_keys_path.as_deref().map(std::path::PathBuf::as_path);
-    handle_control_conn(ControlStream::Tcp(stream), manager, keys).await
+    handle_control_conn(ControlStream::Tcp(stream), manager, keys, &conn).await
 }
 
 async fn handle_control_conn(
     mut stream: ControlStream,
     manager: Arc<Mutex<SessionManager>>,
     auth_keys_path: Option<&Path>,
+    conn: &ConnCtx,
 ) -> Result<()> {
+    let mut conn = conn.clone();
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
 
@@ -388,8 +500,13 @@ async fn handle_control_conn(
         // `authenticate` performs blocking std I/O for up to `MAX_OFFERS`
         // reads; a blocking region keeps it off the async worker threads (it
         // requires the multi-threaded runtime, see main.rs).
-        if !tokio::task::block_in_place(|| authenticate(&mut stream, path))? {
+        let mut identity = None;
+        if !tokio::task::block_in_place(|| authenticate(&mut stream, path, &mut identity))? {
             return Ok(());
+        }
+        if let Some(id) = identity {
+            conn.authenticated = true;
+            conn.owner = id;
         }
     }
 
@@ -414,11 +531,15 @@ async fn handle_control_conn(
 
     match action.as_str() {
         "list" => {
-            let mg = manager.lock().await;
-            respond_json(&mut stream, &Response::with_shells(json!(mg.list()))).await?;
+            let shells = {
+                let mg = manager.lock().await;
+                json!(mg.list(conn.id))
+            };
+            let resp = Response::with_shells(shells).with_connection(conn.json());
+            respond_json(&mut stream, &resp).await?;
         }
-        "send" => send_handler(cmd, &manager, &mut stream).await?,
-        "read" => read_handler(cmd, &manager, &mut stream).await?,
+        "send" => send_handler(cmd, &manager, &mut stream, &conn).await?,
+        "read" => read_handler(cmd, &manager, &mut stream, &conn).await?,
         "push" => push_handler(cmd, &manager, &mut stream).await?,
         "pull" => pull_handler(cmd, &manager, &mut stream).await?,
         "targ_cancel" => targ_cancel_handler(cmd, &manager).await?,
@@ -427,7 +548,7 @@ async fn handle_control_conn(
             mg.remove(cmd.id.unwrap_or(0));
             respond_json(&mut stream, &Response::ok()).await?;
         }
-        "interact" => interact_handler(cmd, &manager, &mut stream).await?,
+        "interact" => interact_handler(cmd, &manager, &mut stream, &conn).await?,
         "connect" => return connect_handler(cmd, &manager, stream).await,
         _ => respond_json(&mut stream, &Response::error(format!("Unknown action: {action}"))).await?,
     }
@@ -440,9 +561,10 @@ async fn send_handler(
     cmd: Command,
     manager: &Arc<Mutex<SessionManager>>,
     stream: &mut ControlStream,
+    conn: &ConnCtx,
 ) -> Result<()> {
     let id = cmd.id.unwrap_or(0);
-    let command = cmd.data.unwrap_or_default().trim().to_string();
+    let command = cmd.data.as_deref().unwrap_or_default().trim().to_string();
     let timeout = cmd.timeout.unwrap_or(3.0);
 
     // Single lock — look up session and dispatch
@@ -497,13 +619,35 @@ async fn send_handler(
             }
         }
         Some(ManagedSession::Tcp(s, b)) => {
+            let writer = Arc::clone(&s.writer);
+            let buf = Arc::clone(b);
+            let lock = Arc::clone(&s.lock);
+            drop(mg);
+
+            // Dumb shells are unframed: commands are written raw and output is
+            // read from one shared buffer, so only one client may use the
+            // session at a time.  The guard lives until this handler returns —
+            // i.e. until the client's connection closes, however that happens.
+            let tcp_timeout = if timeout > 0.0 { timeout } else { 3.0 };
+            // Keep the lease valid for at least as long as this command may run,
+            // so the reaper cannot free the session mid-command over TCP.
+            let ttl = conn.lease.map(|d| d.max(Duration::from_secs_f64(tcp_timeout.max(0.0) + 60.0)));
+            let guard = match acquire_or_refuse(&lock, conn, &cmd, stream, ttl).await? {
+                Some(g) => g,
+                None => return Ok(()),
+            };
+
+            // Discard anything a previous holder left in the shared buffer, so
+            // its output cannot be mistaken for ours.
+            buf.lock().await.clear();
+
             let to_send = format!("{command}\n");
             {
-                let mut w = s.writer.lock().await;
+                let mut w = writer.lock().await;
                 w.write_all(to_send.as_bytes()).await?;
             }
-            let tcp_timeout = if timeout > 0.0 { timeout } else { 3.0 };
-            let resp = respond_read(b, tcp_timeout).await;
+            let resp = respond_read_locked(&buf, tcp_timeout, &guard).await;
+            drop(guard);
             respond_json(stream, &resp).await
         }
         None => respond_json(stream, &Response::error("Shell not found")).await,
@@ -516,20 +660,30 @@ async fn read_handler(
     cmd: Command,
     manager: &Arc<Mutex<SessionManager>>,
     stream: &mut ControlStream,
+    conn: &ConnCtx,
 ) -> Result<()> {
     let id = cmd.id.unwrap_or(0);
     let timeout = cmd.timeout.unwrap_or(0.2);
 
-    let mg = manager.lock().await;
-    let buf = match mg.sessions.get(&id) {
-        Some(ManagedSession::Smart(s)) => Some(Arc::clone(&s.shell_buf)),
-        Some(ManagedSession::Tcp(_, b)) => Some(Arc::clone(b)),
-        None => None,
+    let found = {
+        let mg = manager.lock().await;
+        mg.sessions.get(&id).map(|s| match s {
+            ManagedSession::Smart(sm) => (Arc::clone(&sm.shell_buf), None),
+            ManagedSession::Tcp(_, b) => (Arc::clone(b), Some(ManagedSession::lock(s))),
+        })
     };
-    drop(mg);
 
-    match buf {
-        Some(buf) => {
+    match found {
+        Some((buf, Some(lock))) => {
+            let guard = match acquire_or_refuse(&lock, conn, &cmd, stream, conn.lease).await? {
+                Some(g) => g,
+                None => return Ok(()),
+            };
+            let resp = respond_read_locked(&buf, timeout, &guard).await;
+            drop(guard);
+            respond_json(stream, &resp).await
+        }
+        Some((buf, None)) => {
             let output = shells::read_from_buf(&buf, timeout).await;
             respond_json(stream, &Response::with_output(output)).await
         }
@@ -1169,6 +1323,7 @@ async fn run_interact_bridge(
     stream: &mut ControlStream,
     alive: Arc<AtomicBool>,
     framed: bool,
+    lease: Option<(&LockGuard, Option<Duration>)>,
 ) {
     let done = Arc::new(AtomicBool::new(false));
     let pc = Arc::new(AtomicBool::new(false));
@@ -1188,10 +1343,26 @@ async fn run_interact_bridge(
         framed,
     );
 
+    let mut last_refresh = Instant::now();
     loop {
         tokio::time::sleep(Duration::from_millis(200)).await;
         if !alive.load(Ordering::SeqCst) || pc.load(Ordering::SeqCst) {
             break;
+        }
+        // Keep the session lock alive while attached, and detach if it went
+        // away (lease lapsed, or someone force-took it) instead of silently
+        // sharing the shell.
+        if let Some((guard, ttl)) = lease
+            && last_refresh.elapsed() >= Duration::from_secs(10)
+        {
+            if guard.still_held() {
+                guard.refresh(ttl);
+                last_refresh = Instant::now();
+            } else {
+                let _ = stream.write_all(b"\r\n[!] session lock expired or was taken over; detaching\r\n");
+                let _ = stream.flush();
+                break;
+            }
         }
     }
     done.store(true, Ordering::SeqCst);
@@ -1201,53 +1372,83 @@ async fn interact_handler(
     cmd: Command,
     manager: &Arc<Mutex<SessionManager>>,
     stream: &mut ControlStream,
+    conn: &ConnCtx,
 ) -> Result<()> {
     let id = cmd.id.unwrap_or(0);
 
-    // Smart
-    if let Some((writer, buf, alive, ift)) = {
+    let found = {
         let mg = manager.lock().await;
-        match mg.sessions.get(&id) {
-            Some(ManagedSession::Smart(s)) => Some((
-                Arc::clone(&s.writer),
-                Arc::clone(&s.shell_buf),
-                Arc::clone(&s.alive),
-                Arc::clone(&s.in_file_transfer),
-            )),
-            _ => None,
-        }
-    } {
-        if ift.load(Ordering::SeqCst) {
-            return respond_json(stream, &Response::error("Session busy with file transfer")).await;
-        }
-        respond_json(stream, &serde_json::json!({"status":"ok","message":"Entering interactive mode"})).await?;
-        stream.write_all(b"\r\n[+] Interactive mode. Press Ctrl+C to detach\r\n")?;
-        stream.flush()?;
-        run_interact_bridge(buf, writer, stream, alive, true).await;
-        return Ok(());
+        mg.sessions.get(&id).map(|s| match s {
+            ManagedSession::Smart(sm) => (
+                Arc::clone(&sm.writer),
+                Arc::clone(&sm.shell_buf),
+                Arc::clone(&sm.alive),
+                Some(Arc::clone(&sm.in_file_transfer)),
+                ManagedSession::lock(s),
+                true,
+            ),
+            ManagedSession::Tcp(sm, b) => (
+                Arc::clone(&sm.writer),
+                Arc::clone(b),
+                Arc::clone(&sm.alive),
+                None,
+                ManagedSession::lock(s),
+                false,
+            ),
+        })
+    };
+
+    let Some((writer, buf, alive, ift, lock, framed)) = found else {
+        return respond_json(stream, &Response::error("Shell not found")).await;
+    };
+    if let Some(ift) = &ift
+        && ift.load(Ordering::SeqCst)
+    {
+        return respond_json(stream, &Response::error("Session busy with file transfer")).await;
     }
 
-    // TCP
-    if let Some((sw, sb, alive)) = {
-        let mg = manager.lock().await;
-        match mg.sessions.get(&id) {
-            Some(ManagedSession::Tcp(s, b)) => {
-                Some((Arc::clone(&s.writer), Arc::clone(b), Arc::clone(&s.alive)))
-            }
-            _ => None,
-        }
-    } {
-        respond_json(stream, &serde_json::json!({"status":"ok","message":"Entering interactive mode"})).await?;
-        stream.write_all(b"\r\n[+] Interactive mode. Press Ctrl+C to detach\r\n")?;
-        run_interact_bridge(sb, sw, stream, alive, false).await;
-        return Ok(());
-    }
+    // Interactive attach takes the lock on both kinds: `send` is per-command on
+    // ww-target, but the bridge still shares one output buffer, so two attached
+    // clients would collide.
+    let guard = match acquire_or_refuse(&lock, conn, &cmd, stream, conn.lease).await? {
+        Some(g) => g,
+        None => return Ok(()),
+    };
 
-    respond_json(stream, &Response::error("Shell not found")).await
+    respond_json(stream, &serde_json::json!({"status":"ok","message":"Entering interactive mode"})).await?;
+    stream.write_all(b"\r\n[+] Interactive mode. Press Ctrl+C to detach\r\n")?;
+    stream.flush()?;
+    if !framed {
+        // Dumb shell: start from a clean buffer under our lock.
+        buf.lock().await.clear();
+    }
+    run_interact_bridge(buf, writer, stream, alive, framed, Some((&guard, conn.lease))).await;
+    drop(guard);
+    Ok(())
 }
 
 // ── Shared helper ───────────────────────────────────────────────────────────
 
-async fn respond_read(buf: &Mutex<Vec<u8>>, timeout: f64) -> Response {
-    Response::with_output(shells::read_from_buf(buf, timeout).await)
+/// Poll a dumb-shell's shared buffer, but stop polling as soon as the lock is
+/// gone (someone used `--force`), so we cannot steal the new holder's output.
+async fn respond_read_locked(buf: &Mutex<Vec<u8>>, timeout: f64, guard: &LockGuard) -> Response {
+    let start = Instant::now();
+    loop {
+        if !guard.still_held() {
+            // Displaced: leave the buffer alone; it may hold the new holder's data.
+            return Response::with_output(String::new());
+        }
+        {
+            let mut b = buf.lock().await;
+            if !b.is_empty() {
+                let out = String::from_utf8_lossy(&b).to_string();
+                b.clear();
+                return Response::with_output(out);
+            }
+        }
+        if start.elapsed().as_secs_f64() >= timeout {
+            return Response::with_output(String::new());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }

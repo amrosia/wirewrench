@@ -49,6 +49,12 @@ pub struct Command {
     pub id: Option<u32>,
     pub data: Option<String>,
     pub timeout: Option<f64>,
+    /// Break an existing session lock rather than failing with `busy`.
+    #[serde(default)]
+    pub force: bool,
+    /// Seconds to wait for a busy session lock before giving up (0 = immediate).
+    #[serde(default)]
+    pub wait: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -56,6 +62,9 @@ pub struct Response {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Machine-readable reason for a failure (e.g. `busy`, `locked`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shells: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -64,34 +73,68 @@ pub struct Response {
     pub exit_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stderr: Option<String>,
+    /// Details of the lock that refused this request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock: Option<serde_json::Value>,
+    /// The client's own control connection: transport + authentication state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection: Option<serde_json::Value>,
 }
 
 impl Response {
+    fn base(status: &str) -> Self {
+        Self {
+            status: status.to_string(),
+            message: None,
+            code: None,
+            shells: None,
+            output: None,
+            exit_code: None,
+            stderr: None,
+            lock: None,
+            connection: None,
+        }
+    }
     #[must_use]
     pub fn ok() -> Self {
-        Self { status: "ok".into(), message: None, shells: None, output: None, exit_code: None, stderr: None }
+        Self::base("ok")
     }
     pub fn error(msg: impl Into<String>) -> Self {
-        Self { status: "error".into(), message: Some(msg.into()), shells: None, output: None, exit_code: None, stderr: None }
+        let mut r = Self::base("error");
+        r.message = Some(msg.into());
+        r
+    }
+    /// A session is locked by somebody else.
+    pub fn busy(msg: impl Into<String>, lock: serde_json::Value) -> Self {
+        let mut r = Self::error(msg);
+        r.code = Some("busy".into());
+        r.lock = Some(lock);
+        r
     }
     #[must_use]
     pub fn with_shells(shells: serde_json::Value) -> Self {
-        Self { status: "ok".into(), message: None, shells: Some(shells), output: None, exit_code: None, stderr: None }
+        let mut r = Self::base("ok");
+        r.shells = Some(shells);
+        r
     }
     #[must_use]
     pub fn with_output(out: String) -> Self {
-        Self { status: "ok".into(), message: None, shells: None, output: Some(out), exit_code: None, stderr: None }
+        let mut r = Self::base("ok");
+        r.output = Some(out);
+        r
     }
     #[must_use]
     pub fn with_output_exit(out: String, code: i32, stderr: String) -> Self {
-        Self {
-            status: "ok".into(),
-            message: None,
-            shells: None,
-            output: Some(out),
-            exit_code: Some(code),
-            stderr: if stderr.is_empty() { None } else { Some(stderr) },
-        }
+        let mut r = Self::base("ok");
+        r.output = Some(out);
+        r.exit_code = Some(code);
+        r.stderr = if stderr.is_empty() { None } else { Some(stderr) };
+        r
+    }
+    #[must_use]
+    pub fn with_connection(mut self, connection: serde_json::Value) -> Self {
+        self.connection = Some(connection);
+        self
     }
 }
 
@@ -106,4 +149,22 @@ pub struct ShellInfo {
     /// Target platform reported during the smart handshake (e.g. "windows/x86_64").
     /// `None` for dumb TCP shells, which don't perform a handshake.
     pub platform: Option<String>,
+    /// Current exclusive lock, for sessions that need one (dumb shells).
+    /// `None` for lock-free sessions (ww-target `send`, and free dumb shells).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock: Option<ShellLockInfo>,
+}
+
+/// Who holds a session lock, as reported by `list`.
+#[derive(Serialize, Clone)]
+pub struct ShellLockInfo {
+    /// Human-readable holder (uid / key fingerprint / peer address).
+    pub owner: String,
+    /// True when *this* control connection is the holder.
+    pub mine: bool,
+    /// Seconds the lock has been held.
+    pub held_for: f64,
+    /// Seconds until the lease lapses, if the lock has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_in: Option<f64>,
 }

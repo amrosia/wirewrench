@@ -1,15 +1,25 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use wirewrench::target::protocol;
-use wirewrench::ShellInfo;
+use wirewrench::{ShellInfo, ShellLockInfo};
 
 use super::frame;
+use super::lock::SessionLock;
+
+/// Build the `list` view of a session's lock for the given connection.
+fn lock_view(lock: &SessionLock, conn: u64) -> Option<ShellLockInfo> {
+    lock.holder().map(|s| {
+        let held_for = s.held_for();
+        let expires_in = s.expires_in();
+        ShellLockInfo { owner: s.owner, mine: s.conn == conn, held_for, expires_in }
+    })
+}
 
 /// Control-message queue: (`message_type`, payload) pairs from a ww-target session.
 pub type CtrlQueue = Arc<Mutex<std::collections::VecDeque<(u8, Vec<u8>)>>>;
@@ -22,6 +32,8 @@ pub struct ShellSession {
     created: f64,
     pub alive: Arc<AtomicBool>,
     pub writer: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+    /// Exclusive lock serialising commands (see `super::lock`).
+    pub lock: Arc<SessionLock>,
     reader_handle: tokio::task::JoinHandle<()>,
 }
 
@@ -49,13 +61,21 @@ impl ShellSession {
             created: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(),
             alive: Arc::clone(&alive),
             writer: Arc::new(Mutex::new(writer)),
+            lock: SessionLock::new(),
             reader_handle,
         };
         (session, buf)
     }
 
-    pub fn info(&self) -> ShellInfo {
-        ShellInfo { id: self.id, addr: self.addr.clone(), created: self.created, alive: self.alive.load(Ordering::SeqCst), platform: None }
+    pub fn info(&self, conn: u64) -> ShellInfo {
+        ShellInfo {
+            id: self.id,
+            addr: self.addr.clone(),
+            created: self.created,
+            alive: self.alive.load(Ordering::SeqCst),
+            platform: None,
+            lock: lock_view(&self.lock, conn),
+        }
     }
 
     pub fn close(&mut self) {
@@ -134,6 +154,8 @@ pub struct SmartSession {
     pub pending_cmds: PendingCmds,
     pub tunnels: Tunnels,
     pub next_stream_id: AtomicU32,
+    /// Exclusive lock used for interactive attach (see `super::lock`).
+    pub lock: Arc<SessionLock>,
     reader_handle: tokio::task::JoinHandle<()>,
 }
 
@@ -210,11 +232,18 @@ impl SmartSession {
             tunnels_clone.lock().await.clear();
         });
 
-        Self { id, addr, created: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(), platform, features, supports_tunnels, writer, shell_buf, ctrl_queue, alive, in_file_transfer, next_cmd_seq: AtomicU64::new(1), pending_cmds, tunnels, next_stream_id: AtomicU32::new(1), reader_handle }
+        Self { id, addr, created: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(), platform, features, supports_tunnels, writer, shell_buf, ctrl_queue, alive, in_file_transfer, next_cmd_seq: AtomicU64::new(1), pending_cmds, tunnels, next_stream_id: AtomicU32::new(1), lock: SessionLock::new(), reader_handle }
     }
 
-    pub fn info(&self) -> ShellInfo {
-        ShellInfo { id: self.id, addr: format!("[ww-target] {}", self.addr), created: self.created, alive: self.alive.load(Ordering::SeqCst), platform: self.platform.clone() }
+    pub fn info(&self, conn: u64) -> ShellInfo {
+        ShellInfo {
+            id: self.id,
+            addr: format!("[ww-target] {}", self.addr),
+            created: self.created,
+            alive: self.alive.load(Ordering::SeqCst),
+            platform: self.platform.clone(),
+            lock: lock_view(&self.lock, conn),
+        }
     }
 
     pub fn close(&mut self) {
@@ -231,10 +260,20 @@ pub enum ManagedSession {
 }
 
 impl ManagedSession {
-    pub fn info(&self) -> ShellInfo {
+    pub fn info(&self, conn: u64) -> ShellInfo {
         match self {
-            ManagedSession::Tcp(s, _) => s.info(),
-            ManagedSession::Smart(s) => s.info(),
+            ManagedSession::Tcp(s, _) => s.info(conn),
+            ManagedSession::Smart(s) => s.info(conn),
+        }
+    }
+
+    /// The session's exclusive lock (used for dumb-shell commands and for
+    /// interactive attach).
+    #[must_use]
+    pub fn lock(&self) -> Arc<SessionLock> {
+        match self {
+            ManagedSession::Tcp(s, _) => Arc::clone(&s.lock),
+            ManagedSession::Smart(s) => Arc::clone(&s.lock),
         }
     }
 
@@ -283,7 +322,18 @@ impl SessionManager {
         }
     }
 
-    pub fn list(&self) -> Vec<ShellInfo> {
-        self.sessions.values().map(ManagedSession::info).collect()
+    pub fn list(&self, conn: u64) -> Vec<ShellInfo> {
+        self.sessions.values().map(|s| s.info(conn)).collect()
+    }
+
+    /// Drop expired leases.  Returns `(session id, previous owner)` for logging.
+    pub fn expire_locks(&self, now: Instant) -> Vec<(u32, String)> {
+        let mut expired = Vec::new();
+        for (&id, session) in &self.sessions {
+            if let Some(state) = session.lock().expire_stale(now) {
+                expired.push((id, state.owner));
+            }
+        }
+        expired
     }
 }

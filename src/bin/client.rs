@@ -55,12 +55,26 @@ enum Commands {
         /// Timeout in seconds before giving up on output (default: 0 = no timeout for ww-target; dumb shells still default to 3s)
         #[arg(short = 't', long, default_value = "0.0")]
         timeout: f64,
-        /// Command to execute (all remaining arguments, no extra quoting needed)
-        #[arg(trailing_var_arg = true, num_args = 1..)]
+        /// Take over a session that is locked by another client
+        #[arg(long)]
+        force: bool,
+        /// Seconds to wait for a busy session lock (default 0 = fail immediately)
+        #[arg(long, default_value = "0.0")]
+        wait: f64,
+        /// Command to execute (quote it if it contains shell metacharacters)
+        #[arg(num_args = 1..)]
         command: Vec<String>,
     },
     /// Interact with a shell (Ctrl+C to detach)
-    Interact { id: u32 },
+    Interact {
+        id: u32,
+        /// Take over a session that is locked by another client
+        #[arg(long)]
+        force: bool,
+        /// Seconds to wait for a busy session lock (default 0 = fail immediately)
+        #[arg(long, default_value = "0.0")]
+        wait: f64,
+    },
     /// Close/kill a shell
     Close { id: u32 },
     /// Run commands from a plain-text script file, one command per line
@@ -73,7 +87,13 @@ enum Commands {
     /// The file is a simple list of commands — not a shell script.
     /// Pipes, redirects, variables, and other shell syntax are passed
     /// verbatim to the remote shell and are NOT interpreted locally.
-    Script { id: u32, file: String },
+    Script {
+        id: u32,
+        file: String,
+        /// Take over sessions locked by another client
+        #[arg(long)]
+        force: bool,
+    },
     /// Target (ww-target) operations: push, pull, cancel
     Targ {
         #[command(subcommand)]
@@ -495,44 +515,89 @@ fn send_cmd_raw(cfg: &ClientConfig, cmd: &Value) -> Result<ClientStream> {
 
 // ── List ───────────────────────────────────────────────────────────────────
 
+fn color_enabled() -> bool {
+    std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal()
+}
+
+fn paint(code: &str, s: &str) -> String {
+    if color_enabled() {
+        format!("\x1b[{code}m{s}\x1b[0m")
+    } else {
+        s.to_string()
+    }
+}
+
+/// Header line describing *this* connection's authentication state:
+/// green = key-authenticated, yellow = local Unix socket, red = open TCP.
+fn print_connection_banner(conn: &Value) {
+    if conn.is_null() {
+        return;
+    }
+    let transport = conn["transport"].as_str().unwrap_or("?");
+    let identity = conn["identity"].as_str().unwrap_or("?");
+    let authenticated = conn["authenticated"].as_bool().unwrap_or(false);
+    let line = if authenticated {
+        paint("32", &format!("🔓 authenticated over {transport} as {identity}"))
+    } else if transport == "unix" {
+        paint("33", &format!("🔓 local unix socket, unauthenticated ({identity})"))
+    } else {
+        paint("31", &format!("🔓 unauthenticated {transport} connection ({identity})"))
+    };
+    println!("{line}\n");
+}
+
+/// Lock column: red when another client holds the session, green when we do.
+fn render_lock(lock: &Value) -> String {
+    if lock.is_null() {
+        return format!("{:<26}", "-");
+    }
+    let owner = lock["owner"].as_str().unwrap_or("?");
+    let mine = lock["mine"].as_bool().unwrap_or(false);
+    let held = lock["held_for"].as_f64().unwrap_or(0.0);
+    let who = if mine { "(you)".to_string() } else { owner.to_string() };
+    let plain = format!("{:<26}", format!("🔒 {who} {held:.0}s"));
+    if mine { paint("32", &plain) } else { paint("31", &plain) }
+}
+
 fn cmd_list(cfg: &ClientConfig) -> Result<()> {
     let resp = send_cmd(cfg, &serde_json::json!({"action": "list"}))?;
-    if resp["status"] == "ok" {
-        let shells = &resp["shells"];
-        let arr = shells.as_array().map_or(&[] as &[serde_json::Value], std::vec::Vec::as_slice);
-        if arr.is_empty() {
-            println!("No active shells.");
-        } else {
-            println!("{:<5} {:<25} {:<7} {:<16} Age", "ID", "Address", "Alive", "Platform");
-            println!("{}", "-".repeat(60));
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs_f64();
-            for s in arr {
-                let id = s["id"].as_u64().unwrap_or(0);
-                let addr = s["addr"].as_str().unwrap_or("?");
-                let alive = s["alive"].as_bool().unwrap_or(false);
-                let created = s["created"].as_f64().unwrap_or(0.0);
-                let platform = s["platform"].as_str().unwrap_or("-");
-                let age = (now - created) as u64;
-                let alive_str = if alive { "✓" } else { "✗" };
-                println!("{id:<5} {addr:<25} {alive_str:<7} {platform:<16} {age}s");
-            }
-        }
-    } else {
+    if resp["status"] != "ok" {
         let msg = resp["message"].as_str().unwrap_or("Unknown error");
         eprintln!("Error: {msg}");
+        return Ok(());
+    }
+    print_connection_banner(&resp["connection"]);
+    let arr = resp["shells"].as_array().cloned().unwrap_or_default();
+    if arr.is_empty() {
+        println!("No active shells.");
+        return Ok(());
+    }
+    println!("{:<5} {:<25} {:<7} {:<16} {:<26} Age", "ID", "Address", "Alive", "Platform", "Lock");
+    println!("{}", "-".repeat(87));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    for s in &arr {
+        let id = s["id"].as_u64().unwrap_or(0);
+        let addr = s["addr"].as_str().unwrap_or("?");
+        let alive = s["alive"].as_bool().unwrap_or(false);
+        let created = s["created"].as_f64().unwrap_or(0.0);
+        let platform = s["platform"].as_str().unwrap_or("-");
+        let age = (now - created) as u64;
+        let alive_str = if alive { "✓" } else { "✗" };
+        let lock = render_lock(&s["lock"]);
+        println!("{id:<5} {addr:<25} {alive_str:<7} {platform:<16} {lock} {age}s");
     }
     Ok(())
 }
 
 // ── Send ───────────────────────────────────────────────────────────────────
 
-fn cmd_send(cfg: &ClientConfig, id: u32, command: &str, timeout: f64) -> Result<()> {
+fn cmd_send(cfg: &ClientConfig, id: u32, command: &str, timeout: f64, force: bool, wait: f64) -> Result<()> {
     let resp = send_cmd(cfg, &serde_json::json!({
         "action": "send", "id": id, "data": format!("{}\n", command),
-        "timeout": timeout
+        "timeout": timeout, "force": force, "wait": wait
     }))?;
     if resp["status"] == "error" {
         let msg = resp["message"].as_str().unwrap_or("Unknown");
@@ -585,7 +650,7 @@ fn cmd_close(cfg: &ClientConfig, id: u32) -> Result<()> {
 
 // ── Script ─────────────────────────────────────────────────────────────────
 
-fn cmd_script(cfg: &ClientConfig, id: u32, file: &str) -> Result<()> {
+fn cmd_script(cfg: &ClientConfig, id: u32, file: &str, force: bool) -> Result<()> {
     let content = std::fs::read_to_string(file)
         .with_context(|| format!("Cannot read file '{file}'"))?;
     let lines: Vec<&str> = content
@@ -598,7 +663,7 @@ fn cmd_script(cfg: &ClientConfig, id: u32, file: &str) -> Result<()> {
     for cmd in &lines {
         println!("\n→ {cmd}");
         let resp = send_cmd(cfg, &serde_json::json!({
-            "action": "send", "id": id, "data": format!("{}\n", cmd)
+            "action": "send", "id": id, "data": format!("{}\n", cmd), "force": force
         }))?;
         if resp["status"] == "error" {
             eprintln!("  Error: {}", resp["message"].as_str().unwrap_or("?"));
@@ -1118,12 +1183,12 @@ fn handle_socks_client(
 
 // ── Interact ───────────────────────────────────────────────────────────────
 
-fn cmd_interact(cfg: &ClientConfig, id: u32) -> Result<()> {
+fn cmd_interact(cfg: &ClientConfig, id: u32, force: bool, wait: f64) -> Result<()> {
     use rustyline::DefaultEditor;
     use rustyline::error::ReadlineError;
 
     let mut stream = send_cmd_raw(cfg, &serde_json::json!({
-        "action": "interact", "id": id
+        "action": "interact", "id": id, "force": force, "wait": wait
     }))?;
 
     // Read JSON response
@@ -1217,7 +1282,7 @@ fn main() -> Result<()> {
     let cfg = ClientConfig::resolve(&cli)?;
     match &cli.command {
         Commands::List => cmd_list(&cfg),
-        Commands::Send { id, command, stdin, timeout } => {
+        Commands::Send { id, command, stdin, timeout, force, wait } => {
             let cmd_str = if *stdin {
                 let mut buf = String::new();
                 std::io::stdin().read_to_string(&mut buf)?;
@@ -1225,11 +1290,11 @@ fn main() -> Result<()> {
             } else {
                 command.join(" ")
             };
-            cmd_send(&cfg, *id, &cmd_str, *timeout)
+            cmd_send(&cfg, *id, &cmd_str, *timeout, *force, *wait)
         }
-        Commands::Interact { id } => cmd_interact(&cfg, *id),
+        Commands::Interact { id, force, wait } => cmd_interact(&cfg, *id, *force, *wait),
         Commands::Close { id } => cmd_close(&cfg, *id),
-        Commands::Script { id, file } => cmd_script(&cfg, *id, file),
+        Commands::Script { id, file, force } => cmd_script(&cfg, *id, file, *force),
         Commands::Targ { action } => match action {
             TargAction::Upload { id, local, remote, timeout } => {
                 cmd_targ_upload(&cfg, *id, local, remote.as_deref(), *timeout)

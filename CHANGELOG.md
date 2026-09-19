@@ -1,5 +1,47 @@
 # Changelog
 
+## v3.5.0 — session locks for dumb shells
+
+Dumb reverse shells have no framing: commands are written raw and output is read
+from one shared buffer, so two clients using the same shell at once interleaved
+commands and stole each other's output.  Each dumb shell now carries an
+exclusive lock.
+
+- **Lock ownership is bound to the control connection**, so a lock is released
+the instant the holder's connection ends — `ww` exiting, Ctrl-C, a crash, or
+`kill -9`.  A shell can no longer be left hardlocked by a dying client
+(verified end to end).
+- **Lease + reaper** as a second safety net: TCP control connections carry a
+300 s lease that is refreshed while the holder works, so a half-open peer
+(network partition, killed VM) cannot pin a shell; a background reaper logs every
+expiry.  Unix sockets need no lease — the kernel closes the fd.
+- **`--force`** breaks a lock held by a client that is alive but stuck, on
+`send`, `interact` and `script`.  The displaced holder's pending read stops
+immediately, so it cannot steal the new holder's output.
+- **`--wait SECS`** queues (FIFO) for a busy shell instead of failing.
+- **`ww list` shows the holder**: red lock when another client holds the shell,
+green when it is you, `-` when free — or when the session is a `ww-target`,
+which is concurrency-safe and never takes a lock.
+- **`ww list` shows your own authentication state**: a green `🔓` banner with the
+identity when the control connection is key-authenticated, yellow for the local
+Unix socket, red for an unauthenticated TCP control port.  Holders are resolved
+from `SO_PEERCRED` (`ben (uid=1000)`) or the key fingerprint.  Colour is
+suppressed for non-terminals and when `NO_COLOR` is set.
+- Stale bytes left in a dumb shell's shared buffer by a previous holder are
+drained when the next holder acquires the lock, so output can no longer be
+attributed to the wrong command.
+- The server no longer holds the global session-manager lock across a dumb
+shell's output read, so one client's command no longer stalls `list` (or any
+other client) for the length of the timeout.
+- `ww send`: flags may now appear after the command.  `command` was a trailing
+var-arg, so `ww send 1 "cmd" -t 5` silently ran `cmd -t 5` with the default
+timeout; `-t/--force/--wait` are now parsed wherever they appear.
+- Protocol: `send`/`read`/`interact` accept `force` and `wait`; `list` returns a
+per-shell `lock` object plus a connection-level `connection` object.
+- Tests: `tests/e2e_locks.sh` (10 end-to-end checks) and 9 unit tests for the
+lock primitive.  No backwards-compatibility shims — upgrade `ww` and
+`ww-server` together.
+
 ## v3.4.1 — security & robustness fixes for tunneling
 
 - **Security: SOCKS5 auth was bypassable.**  With `--socks-user/--socks-pass`

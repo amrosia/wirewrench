@@ -6,12 +6,15 @@ mod session;
 mod shells;
 mod handlers;
 mod auth;
+mod lock;
 #[path = "../config.rs"]
 mod config;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -51,7 +54,17 @@ struct Args {
 
 // ── Control server (Unix socket) ─────────────────────────────────────────
 
-async fn control_server(manager: Arc<Mutex<SessionManager>>, socket_path: &str) -> Result<()> {
+/// Lease for TCP control connections.  A half-open peer (network partition,
+/// killed VM) never sends FIN, so `EOF` alone cannot release its session locks;
+/// an unrefreshed lock lapses after this long.  Unix sockets need no lease:
+/// the kernel closes the fd, and the handler then releases the lock.
+const TCP_CONTROL_LEASE: Duration = Duration::from_secs(300);
+
+async fn control_server(
+    manager: Arc<Mutex<SessionManager>>,
+    socket_path: &str,
+    conn_ids: Arc<AtomicU64>,
+) -> Result<()> {
     let _ = std::fs::remove_file(socket_path);
     let listener = UnixListener::bind(socket_path)
         .with_context(|| format!("Failed to bind Unix socket at {socket_path}"))?;
@@ -62,8 +75,9 @@ async fn control_server(manager: Arc<Mutex<SessionManager>>, socket_path: &str) 
         match listener.accept().await {
             Ok((stream, _)) => {
                 let mgr = Arc::clone(&manager);
+                let id = conn_ids.fetch_add(1, Ordering::SeqCst);
                 tokio::spawn(async move {
-                    if let Err(e) = handlers::handle_control_unix(stream, mgr).await {
+                    if let Err(e) = handlers::handle_control_unix(stream, mgr, id, None).await {
                         eprintln!("[-] Control handler error: {e}");
                     }
                 });
@@ -82,6 +96,7 @@ async fn control_tcp_server(
     host: &str,
     port: u16,
     auth_keys_path: Option<Arc<PathBuf>>,
+    conn_ids: Arc<AtomicU64>,
 ) -> Result<()> {
     let addr = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await
@@ -93,8 +108,11 @@ async fn control_tcp_server(
             Ok((stream, _)) => {
                 let mgr = Arc::clone(&manager);
                 let keys = auth_keys_path.clone();
+                let id = conn_ids.fetch_add(1, Ordering::SeqCst);
                 tokio::spawn(async move {
-                    if let Err(e) = handlers::handle_control_tcp(stream, mgr, keys).await {
+                    if let Err(e) =
+                        handlers::handle_control_tcp(stream, mgr, keys, id, Some(TCP_CONTROL_LEASE)).await
+                    {
                         eprintln!("[-] Control TCP handler error: {e}");
                     }
                 });
@@ -124,6 +142,24 @@ async fn main() -> Result<()> {
     }
 
     let manager = Arc::new(Mutex::new(SessionManager::new()));
+    let conn_ids = Arc::new(AtomicU64::new(1));
+
+    // Reap session locks whose lease lapsed (TCP peers that went away without
+    // closing the socket).  Without this a half-open control connection could
+    // keep a dumb shell locked indefinitely.
+    let reaper_mgr = Arc::clone(&manager);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let expired = {
+                let mg = reaper_mgr.lock().await;
+                mg.expire_locks(Instant::now())
+            };
+            for (id, owner) in expired {
+                eprintln!("[!] Session #{id}: lock lease expired, released (was held by {owner})");
+            }
+        }
+    });
 
     let mgr1 = Arc::clone(&manager);
     let host1 = args.host.clone();
@@ -156,8 +192,9 @@ async fn main() -> Result<()> {
         let mgr3 = Arc::clone(&manager);
         let host3 = args.host.clone();
         let keys = auth_keys_path.map(Arc::new);
+        let ids3 = Arc::clone(&conn_ids);
         tokio::spawn(async move {
-            if let Err(e) = control_tcp_server(mgr3, &host3, control_port, keys).await {
+            if let Err(e) = control_tcp_server(mgr3, &host3, control_port, keys, ids3).await {
                 eprintln!("[-] Control TCP listener error: {e}");
             }
         });
@@ -166,5 +203,5 @@ async fn main() -> Result<()> {
     }
 
     let sock = args.socket.clone();
-    control_server(manager, &sock).await
+    control_server(manager, &sock, conn_ids).await
 }
